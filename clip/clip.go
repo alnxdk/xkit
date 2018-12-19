@@ -457,8 +457,10 @@ func parseCommand(c *Command, args []string) (*Command, error) {
             break
         }
     }
-    if err = checkMustSetOptions(c); err != nil {
-        c = nil
+    if err == nil {
+        if err = checkMustSetOptions(c); err != nil {
+            c = nil
+        }
     }
     return c, err
 }

@@ -46,7 +46,7 @@ type Command struct {
 
     Arguments   []string
 
-    Run         func() error
+    Run         func(c *Command) error
 
     hide        bool
     parent     *Command
@@ -78,11 +78,11 @@ func Positional(v interface{}, name, desc string) *Option {
     return RootCmd.Positional(v, name, desc)
 }
 
-func SubCommand(name, desc string, run func() error) *Command {
+func SubCommand(name, desc string, run func(c *Command) error) *Command {
     return RootCmd.SubCommand(name, desc, run)
 }
 
-func SetRun(run func() error) {
+func SetRun(run func(c *Command) error) {
     RootCmd.Run = run
 }
 
@@ -164,7 +164,7 @@ func SetHelpOption(shortName byte, longName string) {
     helpOption.longName = longName
 }
 
-func (c *Command) SubCommand(name, desc string, run func() error) *Command {
+func (c *Command) SubCommand(name, desc string, run func(c *Command) error) *Command {
     sc := &Command{name: name, desc: desc, parent: c, Run: run}
     c.subcmds = append(c.subcmds, sc)
     return sc

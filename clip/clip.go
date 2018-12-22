@@ -7,6 +7,7 @@ import (
     "strings"
     "net"
     "bytes"
+    "log"
 )
 
 // need pointer receiver
@@ -46,10 +47,14 @@ type Command struct {
 
     Arguments   []string
 
-    Run         func(c *Command) error
+    run         func(c *Command) error
 
     hide        bool
     parent     *Command
+
+    logfilePath string
+    logfileMaxSz uint
+    logger      *log.Logger
 }
 
 var helpOption = Option{ shortName: 'h', longName: "help",
@@ -83,7 +88,11 @@ func SubCommand(name, desc string, run func(c *Command) error) *Command {
 }
 
 func SetRun(run func(c *Command) error) {
-    RootCmd.Run = run
+    RootCmd.run = run
+}
+
+func SetLogfile(path string, maxSize uint) *Command {
+    return RootCmd.SetLogfile(path, maxSize)
 }
 
 func optConv(v interface{}) IOption {
@@ -165,9 +174,35 @@ func SetHelpOption(shortName byte, longName string) {
 }
 
 func (c *Command) SubCommand(name, desc string, run func(c *Command) error) *Command {
-    sc := &Command{name: name, desc: desc, parent: c, Run: run}
+    sc := &Command{name: name, desc: desc, parent: c, run: run}
     c.subcmds = append(c.subcmds, sc)
     return sc
+}
+
+func (c *Command) SetLogfile(path string, maxSize uint) *Command {
+    c.logfilePath = path
+    c.logfileMaxSz = maxSize
+    return c
+}
+
+func (c *Command) Run() error {
+    if c.run == nil {
+        return fmt.Errorf("command %s not runnable", c.name)
+    }
+    if len(c.logfilePath) > 0 {
+        file, err := os.OpenFile(c.logfilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+        if err == nil {
+            c.logger = log.New(file, "", 0)
+            defer file.Close()
+        }
+    }
+    return c.run(c)
+}
+
+func (c *Command) Logf(format string, v ...interface{}) {
+    if c.logger != nil {
+        c.logger.Printf(format, v...)
+    }
 }
 
 func (o *Option) SetIncrStep(step int) *Option {
@@ -208,9 +243,11 @@ func errf(format string, args ...interface{}) error {
     return fmt.Errorf(fmt.Sprintf("CommandLine: %s", format), args...)
 }
 
+/*
 func prtf(format string, args ...interface{}) {
     fmt.Printf(fmt.Sprintf("CommandLine: %s", format), args...)
 }
+*/
 
 func setNoArgOption(o *Option) {
     if o.incrStep != 0 {
@@ -245,12 +282,12 @@ func parseLongOpt(c *Command, name string, str string) (consumed int, er error) 
             if o.hasArg {
                 if len(kv) == 2 {
                     if er = o.v.Parse(kv[1]); er != nil { return }
-                    prtf("Set long Option %s=%s\n", kv[0], kv[1])
+                    //prtf("Set long Option %s=%s\n", kv[0], kv[1])
                     consumed = 1
                     set, o.status = true, optStSet
                 } else if len(str) > 0 {
                     if er = o.v.Parse(str); er != nil { return }
-                    prtf("Set long Option %s=%s\n", kv[0], str)
+                    //prtf("Set long Option %s=%s\n", kv[0], str)
                     consumed = 2
                     set, o.status = true, optStSet
                 } else {
@@ -263,7 +300,7 @@ func parseLongOpt(c *Command, name string, str string) (consumed int, er error) 
                     return
                 }
                 setNoArgOption(o)
-                prtf("Set long Option %s\n", kv[0])
+                //prtf("Set long Option %s\n", kv[0])
                 consumed = 1
                 set, o.status = true, optStSet
             }
@@ -317,13 +354,13 @@ func parseShortOpt(c *Command, name string, str string) (consumed int, er error)
         if o.hasArg {
             if len(name) > 1 {
                 if er = o.v.Parse(name[1:]); er != nil { return }
-                prtf("Set short Option %s=%s\n", name[:1], name[1:])
+                //prtf("Set short Option %s=%s\n", name[:1], name[1:])
                 consumed = 1
                 o.status = optStSet
                 break
             } else if len(str) > 0 {
                 if er = o.v.Parse(str); er != nil { return }
-                prtf("Set short Option %s=%s\n", name[:1], str)
+                //prtf("Set short Option %s=%s\n", name[:1], str)
                 consumed = 2
                 o.status =  optStSet
                 break
@@ -333,7 +370,7 @@ func parseShortOpt(c *Command, name string, str string) (consumed int, er error)
             }
         } else {
             setNoArgOption(o)
-            prtf("Set short Option %s\n", name[:1])
+            //prtf("Set short Option %s\n", name[:1])
             name = name[1:]
             consumed = 1
             o.status = optStSet
@@ -351,7 +388,7 @@ func parsePositional(c *Command, str string) (consumed int, er error) {
             continue
         }
         if er = o.v.Parse(str); er != nil { return }
-        prtf("Set positianl '%s' to '%s'\n", o.longName, str)
+        //prtf("Set positianl '%s' to '%s'\n", o.longName, str)
         o.status = optStSet
         consumed = 1
         break

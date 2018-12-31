@@ -8,7 +8,11 @@ import (
     "net"
     "bytes"
     "log"
+    "errors"
+    "strconv"
 )
+
+var ErrNotRunnable = errors.New("command not runnable")
 
 // need pointer receiver
 type IOption interface {
@@ -53,8 +57,11 @@ type Command struct {
     parent     *Command
 
     logfilePath string
-    logfileMaxSz uint
+    logfileMaxSz int64
+    logfile     *os.File
     logger      *log.Logger
+    logC        chan string
+    logDoneC    chan struct{}
 }
 
 var helpOption = Option{ shortName: 'h', longName: "help",
@@ -91,7 +98,7 @@ func SetRun(run func(c *Command) error) {
     RootCmd.run = run
 }
 
-func SetLogfile(path string, maxSize uint) *Command {
+func SetLogfile(path string, maxSize string) error {
     return RootCmd.SetLogfile(path, maxSize)
 }
 
@@ -179,29 +186,101 @@ func (c *Command) SubCommand(name, desc string, run func(c *Command) error) *Com
     return sc
 }
 
-func (c *Command) SetLogfile(path string, maxSize uint) *Command {
+func (c *Command) SetLogfile(path string, maxSize string) (err error) {
     c.logfilePath = path
-    c.logfileMaxSz = maxSize
-    return c
+    c.logfileMaxSz, err = parseSize(maxSize)
+    fmt.Printf("%d, %s\n", c.logfileMaxSz, err)
+    return
+}
+
+func parseSize(sz string) (n int64, err error) {
+    var factor int64
+    if len(sz) > 0 {
+        switch sz[len(sz)-1] {
+        case 'k', 'K':
+            factor = 1024
+        case 'm', 'M':
+            factor = 1024 * 1024
+        case 'g', 'G':
+            factor = 1024 * 1024 * 1024
+        default:
+        }
+        if factor > 0 {
+            sz = sz[:len(sz)-1]
+        }
+        n, err = strconv.ParseInt(sz, 0, 64)
+        if err == nil {
+            n *= factor
+        } else {
+            err = fmt.Errorf("invalid log size %s", sz)
+        }
+    }
+    return
 }
 
 func (c *Command) Run() error {
     if c.run == nil {
-        return fmt.Errorf("command %s not runnable", c.name)
+        return ErrNotRunnable
     }
+    var err error
     if len(c.logfilePath) > 0 {
-        file, err := os.OpenFile(c.logfilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-        if err == nil {
-            c.logger = log.New(file, "", 0)
-            defer file.Close()
+        c.logC = make(chan string, 5)
+        c.logDoneC = make(chan struct{})
+        go logfunc(c)
+    }
+    err = c.run(c)
+    if c.logC != nil {
+        if err != nil {
+            c.logC <- fmt.Sprintf("%s", err)
+        }
+        close(c.logC)
+        <-c.logDoneC
+        close(c.logDoneC)
+    }
+
+    return err
+}
+
+func logfunc(c *Command) {
+    for s := range c.logC {
+        if c.logfile == nil {
+            var err error
+            c.logfile, err = os.OpenFile(c.logfilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+            if err == nil {
+                var prefix string
+                if len(c.name) > 0 {
+                    prefix = fmt.Sprintf("[%s] ", c.name)
+                }
+                c.logger = log.New(c.logfile, prefix, log.LstdFlags)
+            } else {
+                fmt.Printf("warn: failed to open log file '%s'", c.logfilePath)
+                c.logger = nil
+            }
+        }
+
+        if c.logfile != nil && c.logfileMaxSz > 0 {
+            fi, err := c.logfile.Stat()
+            if err != nil || fi.Size() > c.logfileMaxSz {
+                c.logfile.Close()
+                c.logfile = nil
+                os.Rename(c.logfilePath, c.logfilePath + ".0")
+            }
+        }
+
+        if c.logger != nil {
+            c.logger.Printf(s)
         }
     }
-    return c.run(c)
+
+    if c.logfile != nil {
+        c.logfile.Close()
+    }
+    c.logDoneC <- struct{}{}
 }
 
 func (c *Command) Logf(format string, v ...interface{}) {
-    if c.logger != nil {
-        c.logger.Printf(format, v...)
+    if c.logC != nil {
+        c.logC <- fmt.Sprintf(format, v...)
     }
 }
 
@@ -487,6 +566,9 @@ func parseCommand(c *Command, args []string) (*Command, error) {
         if consumed > 0 {
             args = args[consumed:]
             if sc != nil {
+                if len(c.logfilePath) > 0 && len(sc.logfilePath) == 0 {
+                    sc.logfilePath = c.logfilePath
+                }
                 c = sc
             }
         } else {

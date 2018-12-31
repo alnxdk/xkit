@@ -328,6 +328,9 @@ func logfunc(c *Command) {
 
 func (c *Command) Logf(format string, v ...interface{}) {
     if c.logC != nil {
+        if len(c.name) > 0 {
+            format = fmt.Sprintf("[%s] %s", c.name, format)
+        }
         c.logC <- fmt.Sprintf(format, v...)
     }
 }

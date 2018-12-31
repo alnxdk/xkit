@@ -189,7 +189,6 @@ func (c *Command) SubCommand(name, desc string, run func(c *Command) error) *Com
 func (c *Command) SetLogfile(path string, maxSize string) (err error) {
     c.logfilePath = path
     c.logfileMaxSz, err = parseSize(maxSize)
-    fmt.Printf("%d, %s\n", c.logfileMaxSz, err)
     return
 }
 

@@ -52,6 +52,8 @@ type Command struct {
     Arguments   []string
 
     run         func(c *Command) error
+    init        func(c *Command) error
+    fini        func(c *Command) error
 
     hide        bool
     parent     *Command
@@ -90,16 +92,24 @@ func Positional(v interface{}, name, desc string) *Option {
     return RootCmd.Positional(v, name, desc)
 }
 
-func SubCommand(name, desc string, run func(c *Command) error) *Command {
-    return RootCmd.SubCommand(name, desc, run)
+func SubCommand(name, desc string) *Command {
+    return RootCmd.SubCommand(name, desc)
+}
+
+func SetRuns(run, init, fini func(c *Command) error) *Command {
+    return RootCmd.SetRuns(run, init, fini)
 }
 
 func SetRun(run func(c *Command) error) {
     RootCmd.run = run
 }
 
-func SetLogfile(path string, maxSize string) error {
-    return RootCmd.SetLogfile(path, maxSize)
+func OpenLogfile(path string, maxSize string) error {
+    return RootCmd.OpenLogfile(path, maxSize)
+}
+
+func CloseLogfile() {
+    RootCmd.CloseLogfile()
 }
 
 func optConv(v interface{}) IOption {
@@ -180,16 +190,38 @@ func SetHelpOption(shortName byte, longName string) {
     helpOption.longName = longName
 }
 
-func (c *Command) SubCommand(name, desc string, run func(c *Command) error) *Command {
-    sc := &Command{name: name, desc: desc, parent: c, run: run}
+func (c *Command) SubCommand(name, desc string) *Command {
+    sc := &Command{name: name, desc: desc, parent: c}
     c.subcmds = append(c.subcmds, sc)
     return sc
 }
 
-func (c *Command) SetLogfile(path string, maxSize string) (err error) {
+func (c *Command) SetRuns(run, init, fini func(c *Command) error) *Command {
+    c.run = run
+    c.init = init
+    c.fini = fini
+    return c
+}
+
+func (c *Command) OpenLogfile(path string, maxSize string) (err error) {
     c.logfilePath = path
     c.logfileMaxSz, err = parseSize(maxSize)
+    if err == nil {
+        c.logC = make(chan string, 5)
+        c.logDoneC = make(chan struct{})
+        go logfunc(c)
+    }
     return
+}
+
+func (c *Command) CloseLogfile() {
+    if c.logC != nil {
+        close(c.logC)
+        <-c.logDoneC
+        close(c.logDoneC)
+        c.logC = nil
+        c.logDoneC = nil
+    }
 }
 
 func parseSize(sz string) (n int64, err error) {
@@ -218,23 +250,40 @@ func parseSize(sz string) (n int64, err error) {
 }
 
 func (c *Command) Run() error {
-    if c.run == nil {
-        return ErrNotRunnable
+    var cmds []*Command
+    for pc := c; pc != nil; {
+        cmds = append(cmds, pc)
+        pc = pc.parent
     }
+
+    var ch chan string
     var err error
-    if len(c.logfilePath) > 0 {
-        c.logC = make(chan string, 5)
-        c.logDoneC = make(chan struct{})
-        go logfunc(c)
+    for i := len(cmds)-1; i>=0; i-- {
+        if cmds[i].init != nil {
+            if err = cmds[i].init(cmds[i]); err != nil {
+                return err
+            }
+        }
+        if cmds[i].logC != nil {
+            ch = cmds[i].logC
+        }
     }
-    err = c.run(c)
-    if c.logC != nil {
-        if err != nil {
+
+    if c.run != nil {
+        if c.logC == nil && ch != nil {
+            c.logC = ch
+        }
+        if err = c.run(c); err != nil && c.logC != nil {
             c.logC <- fmt.Sprintf("%s", err)
         }
-        close(c.logC)
-        <-c.logDoneC
-        close(c.logDoneC)
+    } else {
+        err = ErrNotRunnable
+    }
+
+    for i := 0; i<len(cmds); i++ {
+        if cmds[i].fini != nil {
+            cmds[i].fini(cmds[i])
+        }
     }
 
     return err
@@ -320,12 +369,6 @@ func (o *Option) MustSet() *Option {
 func errf(format string, args ...interface{}) error {
     return fmt.Errorf(fmt.Sprintf("CommandLine: %s", format), args...)
 }
-
-/*
-func prtf(format string, args ...interface{}) {
-    fmt.Printf(fmt.Sprintf("CommandLine: %s", format), args...)
-}
-*/
 
 func setNoArgOption(o *Option) {
     if o.incrStep != 0 {
@@ -565,9 +608,6 @@ func parseCommand(c *Command, args []string) (*Command, error) {
         if consumed > 0 {
             args = args[consumed:]
             if sc != nil {
-                if len(c.logfilePath) > 0 && len(sc.logfilePath) == 0 {
-                    sc.logfilePath = c.logfilePath
-                }
                 c = sc
             }
         } else {

@@ -98,7 +98,7 @@ func newSection(sParent *section, name string) (*section, string) {
 			if sParent.hasNonRawSub {
 				return nil, "multiple non raw section"
 			}
-			sParent.hasNonRawSub = true
+			s.hasNonRawSub = true
 		}
 	}
 

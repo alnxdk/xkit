@@ -108,10 +108,6 @@ func OpenLogfile(path string, maxSize string) error {
     return RootCmd.OpenLogfile(path, maxSize)
 }
 
-func CloseLogfile() {
-    RootCmd.CloseLogfile()
-}
-
 func optConv(v interface{}) IOption {
     var ov IOption
     switch v := v.(type) {
@@ -214,7 +210,7 @@ func (c *Command) OpenLogfile(path string, maxSize string) (err error) {
     return
 }
 
-func (c *Command) CloseLogfile() {
+func (c *Command) closeLogfile() {
     if c.logC != nil {
         close(c.logC)
         <-c.logDoneC
@@ -283,6 +279,9 @@ func (c *Command) Run() error {
     for i := 0; i<len(cmds); i++ {
         if cmds[i].fini != nil {
             cmds[i].fini(cmds[i])
+        }
+        if cmds[i].logC != nil && cmds[i].logDoneC != nil {
+            cmds[i].closeLogfile()
         }
     }
 

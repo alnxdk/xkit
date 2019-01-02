@@ -1,7 +1,7 @@
 // Copyright (c) 2016 Alan Kang. All rights reserved.
 // Chain of middlewares support for httpmux
 
-package httpmux
+package webs
 
 import (
 	"net/http"

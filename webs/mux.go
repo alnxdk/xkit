@@ -1,5 +1,5 @@
 // Copyright (c) 2016 Alan Kang. All rights reserved.
-package httpmux
+package webs
 
 import (
 	"net/http"

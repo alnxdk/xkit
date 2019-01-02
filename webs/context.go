@@ -4,7 +4,7 @@
 // ctx.Vars can be used to store random data by handlers, won't be used
 // by httpmux
 
-package httpmux
+package webs
 
 type param struct {
 	vars []string

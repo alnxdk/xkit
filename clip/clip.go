@@ -520,6 +520,9 @@ func parsePositional(c *Command, str string) (consumed int, er error) {
 
 func parseSubCommand(c *Command, str string) (consumed int, sc *Command, er error) {
     var scTmp *Command
+    if len(c.subcmds) == 0 {
+        return 0, nil, nil // no more subcommands, treat all as arguments
+    }
     for _, s := range c.subcmds {
         scTmp = nil
         if len(s.name) == len(str) {
@@ -543,6 +546,8 @@ func parseSubCommand(c *Command, str string) (consumed int, sc *Command, er erro
     }
     if sc != nil {
         consumed = 1
+    } else {
+        er = fmt.Errorf("'%s' not recognized.", str)
     }
     return
 }

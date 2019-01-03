@@ -31,6 +31,7 @@ type Option struct {
     v           IOption
     shortName   byte
     longName    string
+    argName     string
     desc        string
 
     hasArg      bool
@@ -45,6 +46,7 @@ type Option struct {
 
 type Command struct {
     name, desc  string
+    longDesc    string
     opts        []*Option
     positionals []*Option
     subcmds     []*Command
@@ -67,17 +69,17 @@ type Command struct {
 }
 
 var helpOption = Option{ shortName: 'h', longName: "help",
-                    desc: "Command usage" }
+                    desc: "Help information" }
 
 var RootCmd Command
 var progInfo string
 
-func ArgOption(v interface{}, shortName byte, longName, desc string) *Option {
-    return RootCmd.ArgOption(v, shortName, longName, desc)
+func ArgOption(v interface{}, shortName byte, longName, argName, desc string) *Option {
+    return RootCmd.ArgOption(v, shortName, longName, argName, desc)
 }
 
-func ArgOptionCustom(v IOption, shortName byte, longName, desc string) *Option {
-    return RootCmd.ArgOptionCustom(v, shortName, longName, desc)
+func ArgOptionCustom(v IOption, shortName byte, longName, argName, desc string) *Option {
+    return RootCmd.ArgOptionCustom(v, shortName, longName, argName, desc)
 }
 
 func FlagOption(v *bool, shortName byte, longName, desc string) *Option {
@@ -92,16 +94,12 @@ func Positional(v interface{}, name, desc string) *Option {
     return RootCmd.Positional(v, name, desc)
 }
 
-func SubCommand(name, desc string) *Command {
-    return RootCmd.SubCommand(name, desc)
+func SubCommand(name, desc, longDesc string) *Command {
+    return RootCmd.SubCommand(name, desc, longDesc)
 }
 
 func SetRuns(run, init, fini func(c *Command) error) *Command {
     return RootCmd.SetRuns(run, init, fini)
-}
-
-func SetRun(run func(c *Command) error) {
-    RootCmd.run = run
 }
 
 func OpenLogfile(path string, maxSize string) error {
@@ -159,14 +157,15 @@ func (c *Command) appendOption(o *Option) *Option {
     return o
 }
 
-func (c *Command) ArgOption(v interface{}, shortName byte, longName, desc string) *Option {
-    o := &Option{v: optConv(v), shortName: shortName, longName: longName,
+func (c *Command) ArgOption(v interface{}, shortName byte, longName, argName, desc string) *Option {
+    o := &Option{v: optConv(v), shortName: shortName, longName: longName, argName: argName,
                  desc: desc, hasArg: true}
     return c.appendOption(o)
 }
 
-func (c *Command) ArgOptionCustom(v IOption, shortName byte, longName, desc string) *Option {
-    o := &Option{v: v, shortName: shortName, desc: desc, hasArg: true}
+func (c *Command) ArgOptionCustom(v IOption, shortName byte, longName, argName, desc string) *Option {
+    o := &Option{v: v, shortName: shortName, longName: longName, argName: argName,
+                 desc: desc, hasArg: true}
     return c.appendOption(o)
 }
 
@@ -186,8 +185,8 @@ func SetHelpOption(shortName byte, longName string) {
     helpOption.longName = longName
 }
 
-func (c *Command) SubCommand(name, desc string) *Command {
-    sc := &Command{name: name, desc: desc, parent: c}
+func (c *Command) SubCommand(name, desc, longDesc string) *Command {
+    sc := &Command{name: name, desc: desc, longDesc: longDesc, parent: c}
     c.subcmds = append(c.subcmds, sc)
     return sc
 }
@@ -270,7 +269,7 @@ func (c *Command) Run() error {
             c.logC = ch
         }
         if err = c.run(c); err != nil && c.logC != nil {
-            c.logC <- fmt.Sprintf("%s", err)
+            c.Logf("%s", err)
         }
     } else {
         err = ErrNotRunnable
@@ -685,7 +684,7 @@ func prtList(lst [][2]string, kind string) (n int) {
     if w > 32 { w = 32 }
     w += 2
     for i, o := range lst {
-        if i == 0 {
+        if i == 0 && kind != "" {
             fmt.Printf("%s:\n\n", kind)
         }
         if len(o[0]) > w-2 {
@@ -713,10 +712,18 @@ func prtOptions(os []*Option, kind string, all bool) {
         if o.shortName != 0 {
             buf.WriteByte('-')
             buf.WriteByte(o.shortName)
-            buf.WriteByte(',')
         }
         if len(o.longName) > 0 {
+            if o.shortName != 0 {
+                buf.WriteByte(',')
+            }
             buf.Write([]byte(fmt.Sprintf("--%s", o.longName)))
+        }
+        if o.hasArg {
+            if o.argName == "" {
+                o.argName = "ARG"
+            }
+            buf.Write([]byte(fmt.Sprintf(" <%s>", o.argName)))
         }
         ostr := buf.String()
 
@@ -743,15 +750,23 @@ func prtOptions(os []*Option, kind string, all bool) {
 }
 
 func HelpCommand(c *Command, all bool) {
+    var lst [][2]string
     if (c == &RootCmd) {
         fmt.Printf("%s\n\n", formatText(progInfo, 80, 0, 0))
     } else {
-        fmt.Printf("Command: %s\n", c.name)
+        s := c.longDesc
+        if s == "" {
+            s = c.desc
+        }
+        lst = append(lst, [2]string{c.name, s})
+        if prtList(lst, "") > 0 {
+            fmt.Println()
+        }
+        lst = nil
     }
     prtOptions(c.opts, "Options", all)
     prtOptions(c.positionals, "Positionals", all)
 
-    var lst [][2]string
     for _, sc := range c.subcmds {
         if all || !sc.hide {
             lst = append(lst, [2]string{fmt.Sprintf("  %s", sc.name), sc.desc})

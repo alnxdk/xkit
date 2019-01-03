@@ -49,6 +49,7 @@ func (c *Chain) Next(w http.ResponseWriter, req *http.Request, ctx *Context) {
 
     if h != nil {
         h.ServeHTTP(w, req, ctx)
+        c.Next(w, req, ctx)  // is it? test later
     }
 }
 

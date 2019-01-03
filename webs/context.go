@@ -7,55 +7,55 @@
 package webs
 
 type param struct {
-	vars []string
+    vars []string
 }
 
 type Context struct {
-	Chain
-	params   []*param
-	paramMap map[string]*param
-	Vars     map[string]string
+    Chain
+    params   []*param
+    paramMap map[string]*param
+    Vars     map[string]string
 }
 
 func (ctx *Context) setParam(name, value string) {
-	p := &param{}
-	p.vars = append(p.vars, value)
-	ctx.params = append(ctx.params, p)
-	if len(name) > 0 {
-		if ctx.paramMap == nil {
-			ctx.paramMap = make(map[string]*param)
-		}
-		ctx.paramMap[name] = p
-	}
+    p := &param{}
+    p.vars = append(p.vars, value)
+    ctx.params = append(ctx.params, p)
+    if len(name) > 0 {
+        if ctx.paramMap == nil {
+            ctx.paramMap = make(map[string]*param)
+        }
+        ctx.paramMap[name] = p
+    }
 }
 
 func (ctx *Context) ParamsByIdx(idx int) []string {
-	if idx >= 0 && idx < len(ctx.params) {
-		p := ctx.params[idx]
-		return p.vars
-	}
-	return nil
+    if idx >= 0 && idx < len(ctx.params) {
+        p := ctx.params[idx]
+        return p.vars
+    }
+    return nil
 }
 
 func (ctx *Context) ParamByIdx(idx int) string {
-	vars := ctx.ParamsByIdx(idx)
-	if len(vars) > 0 {
-		return vars[0]
-	}
-	return ""
+    vars := ctx.ParamsByIdx(idx)
+    if len(vars) > 0 {
+        return vars[0]
+    }
+    return ""
 }
 
 func (ctx *Context) ParamsByName(name string) []string {
-	if p, ok := ctx.paramMap[name]; ok {
-		return p.vars
-	}
-	return nil
+    if p, ok := ctx.paramMap[name]; ok {
+        return p.vars
+    }
+    return nil
 }
 
 func (ctx *Context) ParamByName(name string) string {
-	vars := ctx.ParamsByName(name)
-	if len(vars) > 0 {
-		return vars[0]
-	}
-	return ""
+    vars := ctx.ParamsByName(name)
+    if len(vars) > 0 {
+        return vars[0]
+    }
+    return ""
 }

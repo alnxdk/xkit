@@ -2,113 +2,113 @@
 package webs
 
 import (
-	"net/http"
+    "net/http"
 )
 
 type Mux struct {
-	roots map[string]*section
+    roots map[string]*section
 
-	NotFound http.Handler
+    NotFound http.Handler
 
-	PanicHandler func(http.ResponseWriter, *http.Request, interface{})
+    PanicHandler func(http.ResponseWriter, *http.Request, interface{})
 }
 
 type Handler interface {
-	ServeHTTP(http.ResponseWriter, *http.Request, *Context)
+    ServeHTTP(http.ResponseWriter, *http.Request, *Context)
 }
 
 type HandlerFunc func(w http.ResponseWriter, req *http.Request, ctx *Context)
 
 func (hf HandlerFunc) ServeHTTP(w http.ResponseWriter, req *http.Request, ctx *Context) {
-	hf(w, req, ctx)
+    hf(w, req, ctx)
 }
 
 func New() *Mux {
-	return &Mux{}
+    return &Mux{}
 }
 
 func (m *Mux) Get(path string, h Handler) {
-	m.Handle("GET", path, h)
+    m.Handle("GET", path, h)
 }
 
 func (m *Mux) Post(path string, h Handler) {
-	m.Handle("POST", path, h)
+    m.Handle("POST", path, h)
 }
 
 func (m *Mux) Head(path string, h Handler) {
-	m.Handle("HEAD", path, h)
+    m.Handle("HEAD", path, h)
 }
 
 func (m *Mux) Options(path string, h Handler) {
-	m.Handle("OPTIONS", path, h)
+    m.Handle("OPTIONS", path, h)
 }
 
 func (m *Mux) Put(path string, h Handler) {
-	m.Handle("PUT", path, h)
+    m.Handle("PUT", path, h)
 }
 
 func (m *Mux) Patch(path string, h Handler) {
-	m.Handle("PATCH", path, h)
+    m.Handle("PATCH", path, h)
 }
 
 func (m *Mux) Delete(path string, h Handler) {
-	m.Handle("DELETE", path, h)
+    m.Handle("DELETE", path, h)
 }
 
 func (m *Mux) Handle(method, path string, h Handler) {
-	if m.roots == nil {
-		m.roots = make(map[string]*section)
-	}
-	rs, _ := m.roots[method]
-	if rs == nil {
-		errmsg := ""
-		rs, errmsg = newSection(nil, "/")
-		if errmsg != "" {
-			panic(errmsg)
-		}
-		m.roots[method] = rs
-	}
-	rs.addRoute(path, h)
+    if m.roots == nil {
+        m.roots = make(map[string]*section)
+    }
+    rs, _ := m.roots[method]
+    if rs == nil {
+        errmsg := ""
+        rs, errmsg = newSection(nil, "/")
+        if errmsg != "" {
+            panic(errmsg)
+        }
+        m.roots[method] = rs
+    }
+    rs.addRoute(path, h)
 }
 
 func (m *Mux) ServeFiles(path string, root string) {
-	if len(path) < 10 || path[len(path)-10:] != "/*filepath" {
-		panic("path must end with /*filepath in path " + path)
-	}
-	fileServer := http.FileServer(http.Dir(root))
-	h := func(w http.ResponseWriter, req *http.Request, ctx *Context) {
-		req.URL.Path = ctx.ParamByName("filepath")
-		fileServer.ServeHTTP(w, req)
-	}
-	m.Get(path, HandlerFunc(h))
+    if len(path) < 10 || path[len(path)-10:] != "/*filepath" {
+        panic("path must end with /*filepath in path " + path)
+    }
+    fileServer := http.FileServer(http.Dir(root))
+    h := func(w http.ResponseWriter, req *http.Request, ctx *Context) {
+        req.URL.Path = ctx.ParamByName("filepath")
+        fileServer.ServeHTTP(w, req)
+    }
+    m.Get(path, HandlerFunc(h))
 }
 
 func (m *Mux) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	if m.PanicHandler != nil {
-		defer m.reCover(w, req)
-	}
+    if m.PanicHandler != nil {
+        defer m.reCover(w, req)
+    }
 
-	path := req.URL.Path
+    path := req.URL.Path
 
-	if rs := m.roots[req.Method]; rs != nil {
-		ctx := Context{}
-		c := rs.findRoute(path, &ctx)
-		if c != nil {
-			ctx.Chain = *c
-			ctx.Chain.ServeHTTP(w, req, &ctx)
-			return
-		}
-	}
+    if rs := m.roots[req.Method]; rs != nil {
+        ctx := Context{}
+        c := rs.findRoute(path, &ctx)
+        if c != nil {
+            ctx.Chain = *c
+            ctx.Chain.ServeHTTP(w, req, &ctx)
+            return
+        }
+    }
 
-	if m.NotFound != nil {
-		m.NotFound.ServeHTTP(w, req)
-	} else {
-		http.NotFound(w, req)
-	}
+    if m.NotFound != nil {
+        m.NotFound.ServeHTTP(w, req)
+    } else {
+        http.NotFound(w, req)
+    }
 }
 
 func (m *Mux) reCover(w http.ResponseWriter, req *http.Request) {
-	if rc := recover(); rc != nil {
-		m.PanicHandler(w, req, rc)
-	}
+    if rc := recover(); rc != nil {
+        m.PanicHandler(w, req, rc)
+    }
 }

@@ -143,7 +143,7 @@ func (rs *section) addRoute(path string, h Handler) {
     }
 
     if c, ok := h.(*Chain); ok {
-        s.chain.AppendMiddlewares(c.mws...)
+        s.chain.Append(c.mws...)
         s.chain.h = c.h
     } else {
         s.chain.h = h

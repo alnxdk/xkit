@@ -25,13 +25,34 @@ func (c *Chain) Prepend(mws ...Handler) *Chain {
     return c
 }
 
+func (c *Chain) PrependFunc(mws ...HandlerFunc) *Chain {
+    var m []Handler
+    for _, hf := range mws {
+        m = append(m, hf)
+    }
+    return c.Prepend(m...)
+}
+
 func (c *Chain) Append(mws ...Handler) *Chain {
     c.mws = append(c.mws, mws...)
     return c
 }
 
+func (c *Chain) AppendFunc(mws ...HandlerFunc) *Chain {
+    var m []Handler
+    for _, hf := range mws {
+        m = append(m, hf)
+    }
+    return c.Append(m...)
+}
+
 func (c *Chain) Use(h Handler) *Chain {
     c.h = h
+    return c
+}
+
+func (c *Chain) UseFunc(hf Handler) *Chain {
+    c.h = hf
     return c
 }
 
@@ -49,7 +70,7 @@ func (c *Chain) Next(w http.ResponseWriter, req *http.Request, ctx *Context) {
 
     if h != nil {
         h.ServeHTTP(w, req, ctx)
-        c.Next(w, req, ctx)  // is it? test later
+        c.Next(w, req, ctx)
     }
 }
 

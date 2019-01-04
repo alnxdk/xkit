@@ -31,10 +31,6 @@ func (m *Mux) Get(path string, h Handler) {
     m.Handle("GET", path, h)
 }
 
-func (m *Mux) GetFunc(path string, hf HandlerFunc) {
-    m.Handle("GET", path, hf)
-}
-
 func (m *Mux) Post(path string, h Handler) {
     m.Handle("POST", path, h)
 }
@@ -57,6 +53,34 @@ func (m *Mux) Patch(path string, h Handler) {
 
 func (m *Mux) Delete(path string, h Handler) {
     m.Handle("DELETE", path, h)
+}
+
+func (m *Mux) GetFunc(path string, hf HandlerFunc) {
+    m.Handle("GET", path, hf)
+}
+
+func (m *Mux) PostFunc(path string, hf HandlerFunc) {
+    m.Handle("POST", path, hf)
+}
+
+func (m *Mux) HeadFunc(path string, hf HandlerFunc) {
+    m.Handle("HEAD", path, hf)
+}
+
+func (m *Mux) OptionsFunc(path string, hf HandlerFunc) {
+    m.Handle("OPTIONS", path, hf)
+}
+
+func (m *Mux) PutFunc(path string, hf HandlerFunc) {
+    m.Handle("PUT", path, hf)
+}
+
+func (m *Mux) PatchFunc(path string, hf HandlerFunc) {
+    m.Handle("PATCH", path, hf)
+}
+
+func (m *Mux) DeleteFunc(path string, hf HandlerFunc) {
+    m.Handle("DELETE", path, hf)
 }
 
 func (m *Mux) Handle(method, path string, h Handler) {

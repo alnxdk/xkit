@@ -31,6 +31,10 @@ func (m *Mux) Get(path string, h Handler) {
     m.Handle("GET", path, h)
 }
 
+func (m *Mux) GetFunc(path string, hf HandlerFunc) {
+    m.Handle("GET", path, hf)
+}
+
 func (m *Mux) Post(path string, h Handler) {
     m.Handle("POST", path, h)
 }

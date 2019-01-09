@@ -247,10 +247,15 @@ func (c *Command) Run() error {
 
     var ch chan string
     var err error
-    for i := len(cmds)-1; i>=0; i-- {
+    var i int
+    for i = len(cmds)-1; i>=0; i-- {
+        if cmds[i].logC == nil && ch != nil {
+            cmds[i].logC = ch
+        }
         if cmds[i].init != nil {
             if err = cmds[i].init(cmds[i]); err != nil {
-                return err
+                cmds[i].ErrLogf("%s", err)
+                break
             }
         }
         if cmds[i].logC != nil {
@@ -258,18 +263,18 @@ func (c *Command) Run() error {
         }
     }
 
-    if c.run != nil {
+    if c.run != nil && err == nil {
         if c.logC == nil && ch != nil {
             c.logC = ch
         }
         if err = c.run(c); err != nil && c.logC != nil {
-            c.Logf("%s", err)
+            c.ErrLogf("%s", err)
         }
     } else {
         err = ErrNotRunnable
     }
 
-    for i := 0; i<len(cmds); i++ {
+    for ; i<len(cmds); i++ {
         if cmds[i].fini != nil {
             cmds[i].fini(cmds[i])
         }
@@ -325,6 +330,10 @@ func (c *Command) Logf(format string, v ...interface{}) {
         }
         c.logC <- fmt.Sprintf(format, v...)
     }
+}
+
+func (c *Command) ErrLogf(format string, v ...interface{}) {
+    c.Logf("Error " + format, v...)
 }
 
 func (o *Option) SetIncrStep(step int) *Option {

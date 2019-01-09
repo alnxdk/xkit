@@ -147,12 +147,6 @@ func (c *Command) PositionalCustom(v IOption, name, desc string) *Option {
 }
 
 func (c *Command) appendOption(o *Option) *Option {
-    if o.shortName == helpOption.shortName {
-        helpOption.shortName = 0
-    }
-    if o.longName == helpOption.longName {
-        helpOption.longName = ""
-    }
     c.opts = append(c.opts, o)
     return o
 }
@@ -636,7 +630,7 @@ func Parse() (*Command, error) {
     return parseCommand(&RootCmd, os.Args[1:])
 }
 
-func formatText(text string, width, indent, indentFrom uint) string {
+func FormatText(text string, width, indent, indentFrom uint) string {
     var buf bytes.Buffer
     indstr := "\n"
 
@@ -661,6 +655,7 @@ func formatText(text string, width, indent, indentFrom uint) string {
             word = text[:wlen]
             text = text[wlen:]
         } else {
+            wlen = len(text)
             word = text
             text = ""
         }
@@ -694,10 +689,10 @@ func prtList(lst [][2]string, kind string) (n int) {
         }
         if len(o[0]) > w-2 {
             fmt.Printf("%s\n", o[0])
-            fmt.Printf("%s\n", formatText(o[1], uint(80-w), uint(w), 0))
+            fmt.Printf("%s\n", FormatText(o[1], uint(80-w), uint(w), 0))
         } else {
             fmt.Printf("%-[1]*s", w, o[0])
-            fmt.Printf("%s\n", formatText(o[1], uint(80-w), uint(w), 1))
+            fmt.Printf("%s\n", FormatText(o[1], uint(80-w), uint(w), 1))
         }
         n++
     }
@@ -707,9 +702,13 @@ func prtList(lst [][2]string, kind string) (n int) {
 func prtOptions(os []*Option, kind string, all bool) {
     var buf bytes.Buffer
     var lst [][2]string
+    var idx int
 
     for _, o := range os {
         if !all && o.hide {
+            continue
+        }
+        if o.shortName == helpOption.shortName && o.longName == helpOption.longName {
             continue
         }
         buf.Reset()
@@ -722,7 +721,12 @@ func prtOptions(os []*Option, kind string, all bool) {
             if o.shortName != 0 {
                 buf.WriteByte(',')
             }
-            buf.Write([]byte(fmt.Sprintf("--%s", o.longName)))
+            if kind == "Options" {
+                buf.Write([]byte(fmt.Sprintf("--%s", o.longName)))
+            } else {
+                idx++
+                buf.Write([]byte(fmt.Sprintf("%d. %s", idx, o.longName)))
+            }
         }
         if o.hasArg {
             if o.argName == "" {
@@ -756,8 +760,11 @@ func prtOptions(os []*Option, kind string, all bool) {
 
 func HelpCommand(c *Command, all bool) {
     var lst [][2]string
+    if c == nil {
+        c = &RootCmd
+    }
     if (c == &RootCmd) {
-        fmt.Printf("%s\n\n", formatText(progInfo, 80, 0, 0))
+        fmt.Printf("%s\n\n", FormatText(progInfo, 80, 0, 0))
     } else {
         s := c.longDesc
         if s == "" {

@@ -263,17 +263,20 @@ func (c *Command) Run() error {
         }
     }
 
-    if c.run != nil && err == nil {
-        if c.logC == nil && ch != nil {
-            c.logC = ch
+    if err == nil {
+        if c.run != nil {
+            if c.logC == nil && ch != nil {
+                c.logC = ch
+            }
+            if err = c.run(c); err != nil && c.logC != nil {
+                c.ErrLogf("%s", err)
+            }
+        } else {
+            err = ErrNotRunnable
         }
-        if err = c.run(c); err != nil && c.logC != nil {
-            c.ErrLogf("%s", err)
-        }
-    } else {
-        err = ErrNotRunnable
     }
 
+    if i < 0 { i = 0 }
     for ; i<len(cmds); i++ {
         if cmds[i].fini != nil {
             cmds[i].fini(cmds[i])

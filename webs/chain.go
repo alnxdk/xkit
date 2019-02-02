@@ -51,7 +51,7 @@ func (c *Chain) Use(h Handler) *Chain {
     return c
 }
 
-func (c *Chain) UseFunc(hf Handler) *Chain {
+func (c *Chain) UseFunc(hf HandlerFunc) *Chain {
     c.h = hf
     return c
 }

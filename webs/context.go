@@ -15,6 +15,8 @@ type Context struct {
     params   []*param
     paramMap map[string]*param
     Vars     map[string]string
+
+    ServeFileRoot string
 }
 
 func (ctx *Context) setParam(name, value string) {

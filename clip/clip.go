@@ -635,11 +635,14 @@ func parseCommand(c *Command, args []string) (*Command, error) {
     return c, err
 }
 
-func Parse() (*Command, error) {
+func Parse(args []string) (*Command, error) {
     if helpOption.shortName != 0 || len(helpOption.longName) > 0 {
         RootCmd.opts = append(RootCmd.opts, &helpOption)
     }
-    return parseCommand(&RootCmd, os.Args[1:])
+    if len(args) == 0 {
+        return parseCommand(&RootCmd, os.Args[1:])
+    }
+    return parseCommand(&RootCmd, args[1:])
 }
 
 func FormatText(text string, width, indent, indentFrom uint) string {

@@ -3,6 +3,7 @@
 package webs
 
 import (
+    //"fmt"
     "regexp"
     "strings"
 )
@@ -47,7 +48,14 @@ func (s sectionType) String() string {
     return n
 }
 
-func newSection(sParent *section, name string) (*section, string) {
+// echo secion in the URL can be one of four types
+//  SectionTypeRaw:
+//    normal text which contains no special charactor, and will be treated as is
+//  SectionTypeWildCard:
+//  SectionTypeMatch:
+//  SectionTypeRegexp:
+
+func newSection(m *Mux, sParent *section, name string) (*section, string) {
     s := &section{}
     switch name[0] {
     case ':':
@@ -56,6 +64,7 @@ func newSection(sParent *section, name string) (*section, string) {
     case '*':
         s.sType = SectionTypeWildCard
         s.sName = name[1:]
+        m.hasWildcard = true
     case '#':
         s.sType = SectionTypeRegexp
         var re string
@@ -107,9 +116,20 @@ func newSection(sParent *section, name string) (*section, string) {
     return s, ""
 }
 
-func (rs *section) addRoute(path string, h Handler) {
-    if h == nil {
-        panic("handle not defined for path " + path)
+func (rs *section) addRoute(m *Mux, path string, h Handler) {
+    // verify arguments not empty
+    if hf, ok := h.(HandlerFunc); ok {
+        if hf == nil {
+            panic("nil handler function")
+        }
+    } else if c, ok := h.(*Chain); ok {
+        if c == nil {
+            panic("nil chain handler")
+        } else if c.h == nil {
+            panic("chain has nil handler")
+        }
+    } else if h == nil {
+        panic("nil handler")
     }
     if len(path) == 0 || path[0] != '/' {
         panic("path must begin with '/'")
@@ -129,11 +149,10 @@ func (rs *section) addRoute(path string, h Handler) {
         ss, ok := s.subs[p]
         if !ok {
             errmsg := ""
-            if ss, errmsg = newSection(s, p); errmsg != "" {
+            if ss, errmsg = newSection(m, s, p); errmsg != "" {
                 panic("error: addRoute: " + path + " " + errmsg)
             }
             s.subs[p] = ss
-
         }
         s = ss
     }
@@ -158,63 +177,75 @@ func (rs *section) addRoute(path string, h Handler) {
     }
 }
 
-func (s *section) match(ps []string, ctx *Context) (m bool, c *Chain, stop bool) {
-    switch s.sType {
-    case SectionTypeWildCard:
-        ctx.setParam(s.sName, strings.Join(ps, "/"))
-        m, c, stop = true, &s.chain, true
-    case SectionTypeMatch:
-        ctx.setParam(s.sName, ps[0])
-        m, c = true, &s.chain
-    case SectionTypeRegexp:
-        if s.regexp.Match([]byte(ps[0])) {
-            ctx.setParam(s.sName, ps[0])
-            m, c = true, &s.chain
+func findRoute(m *Mux, ctx *Context, rs *section, path string) bool {
+    ps := strings.Split(path, "/")
+    pstrim := ps[:0]
+    for _, p := range ps {
+        if ptrim := strings.TrimSpace(p); len(ptrim) > 0 {
+            pstrim = append(pstrim, ptrim)
         }
-    case SectionTypeRaw:
-        fallthrough
-    default:
     }
-    return
+    if len(pstrim) == 0 {
+        return false
+    }
+
+    skipWildcard := true
+    for {
+        for _, ss := range rs.subs {
+            if findRoute_r(ctx, ss, pstrim, skipWildcard) {
+                return true
+            }
+        }
+        if skipWildcard && m.hasWildcard {
+            skipWildcard = false
+        } else {
+            break
+        }
+    }
+    return false
 }
 
-func (rs *section) findRoute(path string, ctx *Context) *Chain {
-    c := &rs.chain
-    s := rs
-    ps := strings.Split(path, "/")
+func findRoute_r(ctx *Context, s *section, path []string, skipWildcard bool) bool {
+    matched, byWildcard, vals :=  s.match(path, skipWildcard)
+    if matched {
+        ctx.path = append(ctx.path, sectionValue{s, vals})
 
-loop:
-    for i, p := range ps {
-        if len(p) == 0 {
-            continue
-        }
-        if s.subs == nil {
-            return nil
-        }
-        if ss, ok := s.subs[p]; ok { // matches raw
-            c = &ss.chain
-            s = ss
-            continue
-        }
-
-        match, stop := false, false
-        for _, ss := range s.subs {
-            match, c, stop = ss.match(ps[i:], ctx)
-            if match {
-                if stop {
-                    break loop
-                } else {
-                    s = ss
-                    continue loop
+        path = path[1:]
+        if len(path) == 0 || byWildcard {
+            return true
+        } else {
+            for _, ss := range s.subs {
+                if found := findRoute_r(ctx, ss, path, skipWildcard); found {
+                    return true
                 }
             }
         }
 
-        return nil
+        ctx.path = ctx.path[:len(ctx.path)-1]
     }
+    return false
+}
 
-    if c.h != nil {
-        return c
+func (s *section) match(p []string, skipWildcard bool) (matched, byWildcard bool, vals []string) {
+    switch s.sType {
+    case SectionTypeRaw:
+        if s.sName == p[0] {
+            vals = append(vals, p[0])
+            return true, false, vals
+        }
+    case SectionTypeMatch:
+        vals = append(vals, p[0])
+        return true, false, vals
+    case SectionTypeRegexp:
+        if vals = s.regexp.FindStringSubmatch(p[0]); vals != nil {
+            return true, false, vals
+        }
+    case SectionTypeWildCard:
+        if !skipWildcard {
+            vals = append(vals, strings.Join(p, "/"))
+            return true, true, vals
+        }
+    default:
     }
-    return nil
+    return false, false, vals
 }

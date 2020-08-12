@@ -7,6 +7,7 @@ import (
 
 type Mux struct {
     roots map[string]*section
+    hasWildcard bool
 
     NotFound http.Handler
 
@@ -90,13 +91,13 @@ func (m *Mux) Handle(method, path string, h Handler) {
     rs, _ := m.roots[method]
     if rs == nil {
         errmsg := ""
-        rs, errmsg = newSection(nil, "/")
+        rs, errmsg = newSection(m, nil, "/")
         if errmsg != "" {
             panic(errmsg)
         }
         m.roots[method] = rs
     }
-    rs.addRoute(path, h)
+    rs.addRoute(m, path, h)
 }
 
 func (m *Mux) ServeFiles(path string, root string, mh Handler) {
@@ -124,10 +125,14 @@ func (m *Mux) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
     if rs := m.roots[req.Method]; rs != nil {
         ctx := Context{}
-        c := rs.findRoute(path, &ctx)
+        var c *Chain = nil
+        if findRoute(m, &ctx, rs, path) {
+            sv := &(ctx.path[len(ctx.path)-1])
+            c = &(sv.s.chain)
+        }
         if c != nil {
-            ctx.Chain = *c
-            ctx.Chain.ServeHTTP(w, req, &ctx)
+            ctx.setParams()
+            c.ServeHTTP(w, req, &ctx)
             return
         }
     }

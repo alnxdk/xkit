@@ -60,16 +60,16 @@ func (c *Chain) Next(w http.ResponseWriter, req *http.Request, ctx *Context) {
     var h Handler
     if c.nextIdx >= 0 && c.nextIdx < len(c.mws) {
         h = c.mws[c.nextIdx]
-    } else if c.nextIdx == len(c.mws) {
-        h = c.h
     } else {
-        return
+        h = c.h
     }
-
-    c.nextIdx++
 
     if h != nil {
         h.ServeHTTP(w, req, ctx)
+    }
+
+    if c.nextIdx < len(c.mws) {
+        c.nextIdx++
         c.Next(w, req, ctx)
     }
 }

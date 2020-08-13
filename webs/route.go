@@ -3,7 +3,6 @@
 package webs
 
 import (
-    //"fmt"
     "regexp"
     "strings"
 )
@@ -94,13 +93,6 @@ func newSection(m *Mux, sParent *section, name string) (*section, string) {
         s.sName = name
     }
 
-    /*
-        if sParent != nil {
-            fmt.Printf("pname=%s ptype=%s", sParent.sName, sParent.sType)
-        }
-        fmt.Printf(" name=%s sName=%s sType=%s regexp=%s\n", name, s.sName, s.sType, s.regexp)
-    */
-
     if sParent != nil {
         if sParent.sType == SectionTypeWildCard {
             return nil, "wildcard not the last section"
@@ -178,6 +170,7 @@ func (rs *section) addRoute(m *Mux, path string, h Handler) {
 }
 
 func findRoute(m *Mux, ctx *Context, rs *section, path string) bool {
+    ctx.path = append(ctx.path, sectionValue{rs, nil})
     ps := strings.Split(path, "/")
     pstrim := ps[:0]
     for _, p := range ps {
@@ -186,7 +179,7 @@ func findRoute(m *Mux, ctx *Context, rs *section, path string) bool {
         }
     }
     if len(pstrim) == 0 {
-        return false
+        return true
     }
 
     skipWildcard := true
@@ -202,6 +195,7 @@ func findRoute(m *Mux, ctx *Context, rs *section, path string) bool {
             break
         }
     }
+    ctx.path = ctx.path[:len(ctx.path)-1]
     return false
 }
 

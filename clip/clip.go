@@ -135,6 +135,9 @@ func (c *Command) Hide() *Command {
 }
 
 func (c *Command) Positional(v interface{}, name, desc string) *Option {
+    if len(c.subcmds) > 0 {
+        panic(fmt.Sprintf("command %s trying to add positional and sub-commands", c.name))
+    }
     o := &Option{v: optConv(v), longName: name, desc: desc}
     c.positionals = append(c.positionals, o)
     return o
@@ -180,6 +183,9 @@ func SetHelpOption(shortName byte, longName string) {
 }
 
 func (c *Command) SubCommand(name, desc, longDesc string) *Command {
+    if len(c.positionals) > 0 {
+        panic(fmt.Sprintf("command %s trying to add positional and sub-commands", c.name))
+    }
     sc := &Command{name: name, desc: desc, longDesc: longDesc, parent: c}
     c.subcmds = append(c.subcmds, sc)
     return sc

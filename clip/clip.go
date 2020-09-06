@@ -45,7 +45,7 @@ type Option struct {
 }
 
 type Command struct {
-    name, desc  string
+    Name, desc  string
     longDesc    string
     opts        []*Option
     positionals []*Option
@@ -103,7 +103,10 @@ func SetRuns(run, init, fini func(c *Command) error) *Command {
 }
 
 func OpenLogfile(path string, maxSize string) error {
-    return RootCmd.OpenLogfile(path, maxSize)
+    RootCmd.logfilePath = path
+    var err error
+    RootCmd.logfileMaxSz, err = parseSize(maxSize)
+    return err
 }
 
 func optConv(v interface{}) IOption {
@@ -136,7 +139,7 @@ func (c *Command) Hide() *Command {
 
 func (c *Command) Positional(v interface{}, name, desc string) *Option {
     if len(c.subcmds) > 0 {
-        panic(fmt.Sprintf("command %s trying to add positional and sub-commands", c.name))
+        panic(fmt.Sprintf("command %s trying to add positional and sub-commands", c.Name))
     }
     o := &Option{v: optConv(v), longName: name, desc: desc}
     c.positionals = append(c.positionals, o)
@@ -184,9 +187,9 @@ func SetHelpOption(shortName byte, longName string) {
 
 func (c *Command) SubCommand(name, desc, longDesc string) *Command {
     if len(c.positionals) > 0 {
-        panic(fmt.Sprintf("command %s trying to add positional and sub-commands", c.name))
+        panic(fmt.Sprintf("command %s trying to add positional and sub-commands", c.Name))
     }
-    sc := &Command{name: name, desc: desc, longDesc: longDesc, parent: c}
+    sc := &Command{Name: name, desc: desc, longDesc: longDesc, parent: c}
     c.subcmds = append(c.subcmds, sc)
     return sc
 }
@@ -196,17 +199,6 @@ func (c *Command) SetRuns(run, init, fini func(c *Command) error) *Command {
     c.init = init
     c.fini = fini
     return c
-}
-
-func (c *Command) OpenLogfile(path string, maxSize string) (err error) {
-    c.logfilePath = path
-    c.logfileMaxSz, err = parseSize(maxSize)
-    if err == nil {
-        c.logC = make(chan string, 5)
-        c.logDoneC = make(chan struct{})
-        go logfunc(c)
-    }
-    return
 }
 
 func (c *Command) closeLogfile() {
@@ -299,24 +291,31 @@ func logfunc(c *Command) {
     for s := range c.logC {
         if c.logfile == nil {
             var err error
-            c.logfile, err = os.OpenFile(c.logfilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-            if err == nil {
-                var prefix string
-                if len(c.name) > 0 {
-                    prefix = fmt.Sprintf("[%s] ", c.name)
+            if c.logfilePath != "" {
+                c.logfile, err = os.OpenFile(c.logfilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+                if err != nil {
+                    fmt.Printf("warn: failed to open log file '%s'", c.logfilePath)
+                    c.logfile = nil
                 }
-                c.logger = log.New(c.logfile, prefix, log.LstdFlags)
             } else {
-                fmt.Printf("warn: failed to open log file '%s'", c.logfilePath)
-                c.logger = nil
+                c.logfile = os.Stdout
             }
         }
 
-        if c.logfile != nil && c.logfileMaxSz > 0 {
+        if c.logfile != nil && c.logger == nil {
+            var prefix string
+            if len(c.Name) > 0 {
+                prefix = fmt.Sprintf("[%s] ", c.Name)
+            }
+            c.logger = log.New(c.logfile, prefix, log.LstdFlags)
+        }
+
+        if c.logfile != os.Stdout && c.logfile != nil && c.logfileMaxSz > 0 {
             fi, err := c.logfile.Stat()
             if err != nil || fi.Size() > c.logfileMaxSz {
                 c.logfile.Close()
                 c.logfile = nil
+                c.logger = nil
                 os.Rename(c.logfilePath, c.logfilePath + ".0")
             }
         }
@@ -326,7 +325,7 @@ func logfunc(c *Command) {
         }
     }
 
-    if c.logfile != nil {
+    if c.logfile != os.Stdout && c.logfile != nil {
         c.logfile.Close()
     }
     c.logDoneC <- struct{}{}
@@ -334,8 +333,8 @@ func logfunc(c *Command) {
 
 func (c *Command) Logf(format string, v ...interface{}) {
     if c.logC != nil {
-        if len(c.name) > 0 {
-            format = fmt.Sprintf("[%s] %s", c.name, format)
+        if len(c.Name) > 0 {
+            format = fmt.Sprintf("[%s] %s", c.Name, format)
         }
         c.logC <- fmt.Sprintf(format, v...)
     }
@@ -537,12 +536,12 @@ func parseSubCommand(c *Command, str string) (consumed int, sc *Command, er erro
     }
     for _, s := range c.subcmds {
         scTmp = nil
-        if len(s.name) == len(str) {
-            if s.name == str {
+        if len(s.Name) == len(str) {
+            if s.Name == str {
                 scTmp = s
             }
-        } else if len(s.name) > len(str) {
-            if strings.HasPrefix(s.name, str) {
+        } else if len(s.Name) > len(str) {
+            if strings.HasPrefix(s.Name, str) {
                 scTmp = s
             }
         }
@@ -642,6 +641,10 @@ func parseCommand(c *Command, args []string) (*Command, error) {
 }
 
 func Parse(args []string) (*Command, error) {
+    RootCmd.logC = make(chan string, 5)
+    RootCmd.logDoneC = make(chan struct{})
+    go logfunc(&RootCmd)
+
     if helpOption.shortName != 0 || len(helpOption.longName) > 0 {
         RootCmd.opts = append(RootCmd.opts, &helpOption)
     }
@@ -791,7 +794,7 @@ func HelpCommand(c *Command, all bool) {
         if s == "" {
             s = c.desc
         }
-        lst = append(lst, [2]string{c.name, s})
+        lst = append(lst, [2]string{c.Name, s})
         if prtList(lst, "") > 0 {
             fmt.Println()
         }
@@ -802,7 +805,7 @@ func HelpCommand(c *Command, all bool) {
 
     for _, sc := range c.subcmds {
         if all || !sc.hide {
-            lst = append(lst, [2]string{fmt.Sprintf("  %s", sc.name), sc.desc})
+            lst = append(lst, [2]string{fmt.Sprintf("  %s", sc.Name), sc.desc})
         }
     }
     if prtList(lst, "Sub-Commands") > 0 {

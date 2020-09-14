@@ -74,6 +74,8 @@ var helpOption = Option{ shortName: 'h', longName: "help",
 var RootCmd Command
 var progInfo string
 
+var Args []string
+
 func ArgOption(v interface{}, shortName byte, longName, argName, desc string) *Option {
     return RootCmd.ArgOption(v, shortName, longName, argName, desc)
 }
@@ -649,9 +651,14 @@ func Parse(args []string) (*Command, error) {
         RootCmd.opts = append(RootCmd.opts, &helpOption)
     }
     if len(args) == 0 {
-        return parseCommand(&RootCmd, os.Args[1:])
+        args = os.Args
     }
-    return parseCommand(&RootCmd, args[1:])
+    for _, s := range args {
+        if len(s) > 0 {
+            Args = append(Args, s)
+        }
+    }
+    return parseCommand(&RootCmd, Args[1:])
 }
 
 func FormatText(text string, width, indent, indentFrom uint) string {

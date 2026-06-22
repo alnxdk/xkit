@@ -12,47 +12,44 @@
 // A [Command] cannot mix positionals and sub-commands; adding both panics at
 // setup time so the bug is caught before any argument is parsed.
 //
-// # Typical use
+// # Typical use — single parser (recommended)
 //
-//	var verbose bool
-//	var outFile string
-//	clip.ProgDescription("my-tool — does something useful")
-//	clip.FlagOption(&verbose, 'v', "verbose", "Enable verbose output")
-//	clip.ArgOption(&outFile, 'o', "output", "FILE", "Output file path")
+//	p := clip.New()
+//	p.ProgDescription("my-tool — does something useful")
+//	p.FlagOption(&verbose, 'v', "verbose", "Enable verbose output")
+//	sub := p.SubCommand("serve", "Start server", "")
+//	sub.SetRuns(serveRun, nil, nil)
 //
-//	cmd, err := clip.Parse(nil) // nil → read os.Args
+//	cmd, err := p.Parse(nil) // nil → os.Args
+//	if errors.Is(err, clip.ErrHelp) {
+//	    os.Exit(0)
+//	}
 //	if err != nil {
 //	    fmt.Fprintln(os.Stderr, err)
-//	    clip.Close()
+//	    p.Close()
 //	    os.Exit(1)
 //	}
 //	os.Exit(func() int {
-//	    if err := cmd.Run(); err != nil {
-//	        fmt.Fprintln(os.Stderr, err)
-//	        return 1
-//	    }
+//	    if err := cmd.Run(); err != nil { fmt.Fprintln(os.Stderr, err); return 1 }
 //	    return 0
 //	}())
 //
-// # Sub-commands
+// # Typical use — package-level convenience API (backwards-compatible)
 //
-//	serve := clip.SubCommand("serve", "Start the HTTP server", "")
-//	serve.SetRuns(serveRun, serveInit, nil)
-//
-// Sub-command names may be abbreviated to any unambiguous prefix on the
-// command line (e.g. "ser" matches "serve" when it is the only sub-command
-// starting with "ser").
+// The package-level functions (FlagOption, SubCommand, Parse, …) delegate to
+// [DefaultParser] and behave identically to calling the same methods on a
+// Parser created with [New].  Use them when one global parser is enough.
 //
 // # Logging
 //
-// Call [OpenLogfile] before [Parse] to redirect log output to a file with
-// optional size-based rotation.  If no path is configured, log lines are
-// written to stdout.  Use [Command.Logf] to write log lines; all I/O is
-// handled by a single background goroutine so callers never block on disk I/O.
+// Call [Parser.OpenLogfile] (or package-level [OpenLogfile]) before [Parser.Parse]
+// to direct log output to a file with optional size-based rotation.  If no path
+// is configured, log lines are written to stdout.  Use [Command.Logf] inside
+// run/init functions.  All I/O is serialised through a single goroutine.
 //
-// [Command.Run] closes the logging goroutine automatically when it returns.
-// If you exit without calling [Command.Run] (e.g. after a [Parse] error),
-// call [Close] to drain and stop the goroutine.
+// [Command.Run] closes the logging goroutine automatically.  If you exit before
+// calling Run (e.g. after a [Parse] error), call [Parser.Close] / [Close] to
+// prevent a goroutine leak.
 package clip
 
 import (
@@ -67,7 +64,28 @@ import (
 	"time"
 )
 
-var ErrNotRunnable = errors.New("command not runnable")
+// Sentinel errors returned by [Parser.Parse].
+var (
+	// ErrHelp is returned when the user requests help (--help / -h).
+	// The help text has already been written to stdout; callers should
+	// exit with status 0.
+	ErrHelp = errors.New("help requested")
+
+	// ErrNotRunnable is returned by [Command.Run] when the matched command
+	// has no run function registered.
+	ErrNotRunnable = errors.New("command not runnable")
+)
+
+// errHelpRequest is an internal carrier for the Command context when the user
+// passes --help.  It satisfies errors.Is(err, ErrHelp) so callers can use
+// errors.Is without caring about the concrete type.
+type errHelpRequest struct {
+	cmd *Command
+	all bool
+}
+
+func (e *errHelpRequest) Error() string        { return ErrHelp.Error() }
+func (e *errHelpRequest) Is(target error) bool { return target == ErrHelp }
 
 // IOption is the interface a custom option value must satisfy.
 // Use [Command.ArgOptionCustom] or [Command.PositionalCustom] to register
@@ -89,25 +107,23 @@ const (
 // Callers receive a *Option from the registration functions and may chain
 // modifier methods ([Option.MustSet], [Option.Hide], etc.) on it.
 type Option struct {
-	v        IOption
+	v         IOption
 	shortName byte
 	longName  string
 	argName   string
 	desc      string
 
-	hasArg   bool
-	incrStep int
-
+	hasArg      bool
+	incrStep    int
 	reverseFlag bool
 	hide        bool
 	repeatable  bool
-
-	status optSt
+	status      optSt
 }
 
-// Command represents a (possibly nested) command with its own set of
-// options, positionals, and run functions.  [RootCmd] is the implicit
-// top-level command; sub-commands are created with [Command.SubCommand].
+// Command represents a (possibly nested) command with its own set of options,
+// positionals, and run functions.  The [Parser]'s embedded Command is the
+// implicit root; sub-commands are created with [Command.SubCommand].
 type Command struct {
 	Name, desc string
 	longDesc   string
@@ -115,8 +131,9 @@ type Command struct {
 	positionals []*Option
 	subcmds     []*Command
 
-	// Arguments holds any tokens that were not consumed as options or positionals
-	// (everything after the first unrecognised token when no sub-commands remain).
+	// Arguments holds tokens not consumed as options or positionals —
+	// everything after the first unrecognised token when no sub-commands remain,
+	// or everything after a bare "--".
 	Arguments []string
 
 	run  func(c *Command) error
@@ -134,103 +151,213 @@ type Command struct {
 	logDoneC     chan struct{}
 }
 
-var helpOption = Option{shortName: 'h', longName: "help", desc: "Help information"}
-
-// RootCmd is the implicit top-level command.  Options registered via the
-// package-level helpers (FlagOption, ArgOption, etc.) are attached here.
-var RootCmd Command
-
-var progInfo string
-
-// Args is populated by [Parse] with the non-empty tokens from the argument
-// vector (os.Args or the slice passed by the caller), including argv[0].
-// It is reset on every [Parse] call so it always reflects the most recent
-// invocation.
-var Args []string
-
-// --- Package-level helpers that forward to RootCmd ---
-
-func ArgOption(v interface{}, shortName byte, longName, argName, desc string) *Option {
-	return RootCmd.ArgOption(v, shortName, longName, argName, desc)
-}
-
-func ArgOptionCustom(v IOption, shortName byte, longName, argName, desc string) *Option {
-	return RootCmd.ArgOptionCustom(v, shortName, longName, argName, desc)
-}
-
-func FlagOption(v *bool, shortName byte, longName, desc string) *Option {
-	return RootCmd.FlagOption(v, shortName, longName, desc)
-}
-
-func IncrOption(v *int, shortName byte, longName, desc string) *Option {
-	return RootCmd.IncrOption(v, shortName, longName, desc)
-}
-
-func Positional(v interface{}, name, desc string) *Option {
-	return RootCmd.Positional(v, name, desc)
-}
-
-func SubCommand(name, desc, longDesc string) *Command {
-	return RootCmd.SubCommand(name, desc, longDesc)
-}
-
-func SetRuns(run, init, fini func(c *Command) error) *Command {
-	return RootCmd.SetRuns(run, init, fini)
-}
-
-// OpenLogfile configures the log file path and optional rotation size for
-// RootCmd.  Call this before [Parse].
+// Parser holds all state for one argument-parsing session.  Create one with
+// [New]; or use the package-level functions which operate on [DefaultParser].
 //
-// maxSize accepts a plain integer (bytes) or a value with a suffix:
-// k/K (kibibytes), m/M (mebibytes), g/G (gibibytes).  An empty string
-// disables rotation.
-func OpenLogfile(path string, maxSize string) error {
-	RootCmd.logfilePath = path
+// Parser embeds [Command] so all Command registration methods (FlagOption,
+// SubCommand, Positional, …) are directly callable on *Parser.
+type Parser struct {
+	Command               // root command; all Command methods are promoted
+	Args       []string   // populated by Parse; reset on every call
+	helpOption Option
+	progInfo   string
+	logBufSize int
+}
+
+// New returns a Parser ready to use, with the default help flag (-h/--help)
+// and a log-channel buffer of 64 entries.
+func New() *Parser {
+	return &Parser{
+		helpOption: Option{shortName: 'h', longName: "help", desc: "Help information"},
+		logBufSize: 64,
+	}
+}
+
+// DefaultParser is the Parser that backs the package-level convenience
+// functions (Parse, FlagOption, SubCommand, …).  Programs that only ever need
+// one parser may use those functions directly instead of calling New().
+var DefaultParser = New()
+
+// ProgDescription sets the summary line shown at the top of root-level help.
+func (p *Parser) ProgDescription(desc string) { p.progInfo = desc }
+
+// SetHelpOption customises the short/long name of the auto-generated help flag.
+// Must be called before Parse.
+func (p *Parser) SetHelpOption(shortName byte, longName string) {
+	p.helpOption.shortName = shortName
+	p.helpOption.longName = longName
+}
+
+// SetLogBufSize sets the capacity of the internal log channel.  Must be called
+// before Parse.  Returns p so calls can be chained.
+func (p *Parser) SetLogBufSize(n int) *Parser {
+	p.logBufSize = n
+	return p
+}
+
+// OpenLogfile configures log output to path with optional size-based rotation.
+// maxSize accepts a plain integer (bytes) or a number with suffix k/K, m/M, g/G.
+// Pass "" to disable rotation.  Must be called before Parse.
+func (p *Parser) OpenLogfile(path, maxSize string) error {
+	p.Command.logfilePath = path
 	var err error
-	RootCmd.logfileMaxSz, err = parseSize(maxSize)
+	p.Command.logfileMaxSz, err = parseSize(maxSize)
 	return err
 }
 
-// Close shuts down the background logging goroutine and waits for it to
-// drain the channel.  [Command.Run] calls this automatically; call it
-// explicitly only when you exit before running the command (e.g. on a
-// [Parse] error) to avoid a goroutine leak.
-func Close() {
-	RootCmd.closeLogfile()
+// Close shuts down the background logging goroutine and waits for it to drain.
+// [Command.Run] calls this automatically.  Call it explicitly when you exit
+// before calling Run to prevent a goroutine leak.
+func (p *Parser) Close() {
+	p.Command.closeLogfile()
 }
+
+// Parse processes the argument vector and returns the matched Command.
+//
+// If args is nil or empty, os.Args is used.  Element [0] is always treated as
+// the program name (included in Parser.Args at index 0) and skipped during
+// option parsing.  A bare "--" token stops option processing; all subsequent
+// tokens are placed in Command.Arguments.
+//
+// If the user passes --help or -h, Parse prints help to stdout and returns
+// (nil, ErrHelp).  Call Close if you do not subsequently call Command.Run.
+func (p *Parser) Parse(args []string) (*Command, error) {
+	// Start the logging goroutine once per Parse/Close cycle.
+	if p.Command.logC == nil {
+		p.Command.logC = make(chan string, p.logBufSize)
+		p.Command.logDoneC = make(chan struct{})
+		go logfunc(&p.Command)
+	}
+
+	// Append the help option exactly once even if Parse is called again on the
+	// same Parser without an intervening Close/Run.
+	hasHelp := false
+	for _, o := range p.Command.opts {
+		if o == &p.helpOption {
+			hasHelp = true
+			break
+		}
+	}
+	if !hasHelp && (p.helpOption.shortName != 0 || len(p.helpOption.longName) > 0) {
+		p.Command.opts = append(p.Command.opts, &p.helpOption)
+	}
+
+	if len(args) == 0 {
+		args = os.Args
+	}
+	// Reset so repeated Parse calls never accumulate stale entries.
+	p.Args = nil
+	for _, s := range args {
+		if len(s) > 0 {
+			p.Args = append(p.Args, s)
+		}
+	}
+
+	cmd, err := parseCommand(&p.Command, p.Args[1:], &p.helpOption)
+	if err != nil {
+		var hr *errHelpRequest
+		if errors.As(err, &hr) {
+			p.HelpCommand(hr.cmd, hr.all)
+			return nil, ErrHelp
+		}
+		return nil, err
+	}
+	return cmd, nil
+}
+
+// HelpCommand prints help for c to stdout.  Pass nil to print root-level help.
+func (p *Parser) HelpCommand(c *Command, all bool) {
+	var lst [][2]string
+	if c == nil {
+		c = &p.Command
+	}
+	if c == &p.Command {
+		fmt.Printf("%s\n\n", FormatText(p.progInfo, 80, 0, 0))
+	} else {
+		s := c.longDesc
+		if s == "" {
+			s = c.desc
+		}
+		lst = append(lst, [2]string{c.Name, s})
+		if prtList(lst, "") > 0 {
+			fmt.Println()
+		}
+		lst = nil
+	}
+	prtOptions(c.opts, "Options", all, &p.helpOption)
+	prtOptions(c.positionals, "Positionals", all, &p.helpOption)
+	for _, sc := range c.subcmds {
+		if all || !sc.hide {
+			lst = append(lst, [2]string{fmt.Sprintf("  %s", sc.Name), sc.desc})
+		}
+	}
+	if prtList(lst, "Sub-Commands") > 0 {
+		fmt.Println()
+	}
+}
+
+// --- Package-level convenience wrappers (all delegate to DefaultParser) ------
+
+func ArgOption(v interface{}, shortName byte, longName, argName, desc string) *Option {
+	return DefaultParser.ArgOption(v, shortName, longName, argName, desc)
+}
+func ArgOptionCustom(v IOption, shortName byte, longName, argName, desc string) *Option {
+	return DefaultParser.ArgOptionCustom(v, shortName, longName, argName, desc)
+}
+func FlagOption(v *bool, shortName byte, longName, desc string) *Option {
+	return DefaultParser.FlagOption(v, shortName, longName, desc)
+}
+func IncrOption(v *int, shortName byte, longName, desc string) *Option {
+	return DefaultParser.IncrOption(v, shortName, longName, desc)
+}
+func Positional(v interface{}, name, desc string) *Option {
+	return DefaultParser.Positional(v, name, desc)
+}
+func SubCommand(name, desc, longDesc string) *Command {
+	return DefaultParser.SubCommand(name, desc, longDesc)
+}
+func SetRuns(run, init, fini func(c *Command) error) *Command {
+	return DefaultParser.SetRuns(run, init, fini)
+}
+func OpenLogfile(path, maxSize string) error  { return DefaultParser.OpenLogfile(path, maxSize) }
+func Close()                                   { DefaultParser.Close() }
+func Parse(args []string) (*Command, error)   { return DefaultParser.Parse(args) }
+func ProgDescription(desc string)              { DefaultParser.ProgDescription(desc) }
+func SetHelpOption(shortName byte, longName string) {
+	DefaultParser.SetHelpOption(shortName, longName)
+}
+func HelpCommand(c *Command, all bool) { DefaultParser.HelpCommand(c, all) }
+
+// --- Command registration methods --------------------------------------------
 
 // optConv maps a typed pointer to the corresponding IOption wrapper.
 func optConv(v interface{}) IOption {
-	var ov IOption
 	switch v := v.(type) {
-	case *bool:          ov = (*clipBool)(v)
-	case *int:           ov = (*clipInt)(v)
-	case *int8:          ov = (*clipInt8)(v)
-	case *int16:         ov = (*clipInt16)(v)
-	case *int32:         ov = (*clipInt32)(v)
-	case *int64:         ov = (*clipInt64)(v)
-	case *uint:          ov = (*clipUint)(v)
-	case *uint8:         ov = (*clipUint8)(v)
-	case *uint16:        ov = (*clipUint16)(v)
-	case *uint32:        ov = (*clipUint32)(v)
-	case *float32:       ov = (*clipFloat32)(v)
-	case *float64:       ov = (*clipFloat64)(v)
-	case *string:        ov = (*clipString)(v)
-	case *time.Duration: ov = (*clipDura)(v)
-	case *net.IP:        ov = (*clipIP)(v)
+	case *bool:          return (*clipBool)(v)
+	case *int:           return (*clipInt)(v)
+	case *int8:          return (*clipInt8)(v)
+	case *int16:         return (*clipInt16)(v)
+	case *int32:         return (*clipInt32)(v)
+	case *int64:         return (*clipInt64)(v)
+	case *uint:          return (*clipUint)(v)
+	case *uint8:         return (*clipUint8)(v)
+	case *uint16:        return (*clipUint16)(v)
+	case *uint32:        return (*clipUint32)(v)
+	case *uint64:        return (*clipUint64)(v)
+	case *float32:       return (*clipFloat32)(v)
+	case *float64:       return (*clipFloat64)(v)
+	case *string:        return (*clipString)(v)
+	case *time.Duration: return (*clipDura)(v)
+	case *net.IP:        return (*clipIP)(v)
 	default:
 		panic(fmt.Sprintf("use _Custom() for Option type %T", v))
 	}
-	return ov
 }
 
-func (c *Command) Hide() *Command {
-	c.hide = true
-	return c
-}
+func (c *Command) Hide() *Command { c.hide = true; return c }
 
-// Positional registers a positional argument on c.  Positionals are consumed
-// in declaration order.  Panics if c already has sub-commands.
+// Positional registers a positional argument on c.  Panics if c already has
+// sub-commands.
 func (c *Command) Positional(v interface{}, name, desc string) *Option {
 	if len(c.subcmds) > 0 {
 		panic(fmt.Sprintf("command %s trying to add positional and sub-commands", c.Name))
@@ -240,7 +367,7 @@ func (c *Command) Positional(v interface{}, name, desc string) *Option {
 	return o
 }
 
-// PositionalCustom is like [Command.Positional] for values that implement
+// PositionalCustom is like [Command.Positional] for values implementing
 // [IOption] directly.  Panics if c already has sub-commands.
 func (c *Command) PositionalCustom(v IOption, name, desc string) *Option {
 	if len(c.subcmds) > 0 {
@@ -257,31 +384,28 @@ func (c *Command) appendOption(o *Option) *Option {
 }
 
 func (c *Command) ArgOption(v interface{}, shortName byte, longName, argName, desc string) *Option {
-	o := &Option{v: optConv(v), shortName: shortName, longName: longName, argName: argName,
-		desc: desc, hasArg: true}
-	return c.appendOption(o)
+	return c.appendOption(&Option{
+		v: optConv(v), shortName: shortName, longName: longName,
+		argName: argName, desc: desc, hasArg: true,
+	})
 }
 
 func (c *Command) ArgOptionCustom(v IOption, shortName byte, longName, argName, desc string) *Option {
-	o := &Option{v: v, shortName: shortName, longName: longName, argName: argName,
-		desc: desc, hasArg: true}
-	return c.appendOption(o)
+	return c.appendOption(&Option{
+		v: v, shortName: shortName, longName: longName,
+		argName: argName, desc: desc, hasArg: true,
+	})
 }
 
 func (c *Command) FlagOption(v *bool, shortName byte, longName, desc string) *Option {
-	o := &Option{v: (*clipBool)(v), shortName: shortName, longName: longName, desc: desc}
-	return c.appendOption(o)
+	return c.appendOption(&Option{v: (*clipBool)(v), shortName: shortName, longName: longName, desc: desc})
 }
 
 func (c *Command) IncrOption(v *int, shortName byte, longName, desc string) *Option {
-	o := &Option{v: (*clipInt)(v), shortName: shortName, longName: longName,
-		desc: desc, incrStep: 1, repeatable: true}
-	return c.appendOption(o)
-}
-
-func SetHelpOption(shortName byte, longName string) {
-	helpOption.shortName = shortName
-	helpOption.longName = longName
+	return c.appendOption(&Option{
+		v: (*clipInt)(v), shortName: shortName, longName: longName,
+		desc: desc, incrStep: 1, repeatable: true,
+	})
 }
 
 // SubCommand creates a child command under c.  Panics if c already has
@@ -296,14 +420,38 @@ func (c *Command) SubCommand(name, desc, longDesc string) *Command {
 }
 
 func (c *Command) SetRuns(run, init, fini func(c *Command) error) *Command {
-	c.run = run
-	c.init = init
-	c.fini = fini
+	c.run, c.init, c.fini = run, init, fini
 	return c
 }
 
-// closeLogfile signals the logging goroutine to stop and waits for it to
-// drain the channel and exit before returning.
+// --- Option modifiers --------------------------------------------------------
+
+func (o *Option) SetIncrStep(step int) *Option {
+	if o.incrStep == 0 {
+		panic("cannot set increment step on non-increment Option")
+	}
+	if step == 0 {
+		panic("increment step cannot be 0")
+	}
+	o.incrStep = step
+	return o
+}
+
+func (o *Option) ReverseFlag() *Option {
+	if _, ok := o.v.(*clipBool); !ok {
+		panic("ReverseFlag on non-bool Option")
+	}
+	o.reverseFlag = true
+	return o
+}
+
+func (o *Option) Hide() *Option       { o.hide = true; return o }
+func (o *Option) Repeatable(r bool) *Option { o.repeatable = r; return o }
+func (o *Option) MustSet() *Option    { o.status = optStMustSet; return o }
+
+// --- Logging -----------------------------------------------------------------
+
+// closeLogfile signals the logging goroutine to stop and waits for it to exit.
 func (c *Command) closeLogfile() {
 	if c.logC != nil {
 		close(c.logC)
@@ -314,46 +462,80 @@ func (c *Command) closeLogfile() {
 	}
 }
 
-// parseSize converts a human-readable size string to bytes.
-// Recognised suffixes: k/K (×1024), m/M (×1024²), g/G (×1024³).
-// A plain integer with no suffix is returned as-is (already in bytes).
-// An empty string returns 0 without error (callers treat 0 as "no limit").
-func parseSize(sz string) (n int64, err error) {
-	var factor int64
-	if len(sz) > 0 {
-		switch sz[len(sz)-1] {
-		case 'k', 'K':
-			factor = 1024
-		case 'm', 'M':
-			factor = 1024 * 1024
-		case 'g', 'G':
-			factor = 1024 * 1024 * 1024
-		default:
-		}
-		if factor > 0 {
-			sz = sz[:len(sz)-1]
-		}
-		n, err = strconv.ParseInt(sz, 0, 64)
-		if err == nil {
-			// A zero factor means no suffix: n is already in bytes, no scaling needed.
-			if factor > 0 {
-				n *= factor
+// logfunc is the single goroutine that owns all file I/O for a Command's log
+// channel.  It opens the destination lazily on the first message, writes each
+// entry, then rotates the file after writing when the size limit is exceeded.
+func logfunc(c *Command) {
+	for s := range c.logC {
+		// Lazily open the log destination on first message.
+		if c.logfile == nil {
+			if c.logfilePath != "" {
+				var err error
+				c.logfile, err = os.OpenFile(c.logfilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if err != nil {
+					fmt.Printf("warn: failed to open log file '%s'\n", c.logfilePath)
+					c.logfile = nil
+				}
+			} else {
+				c.logfile = os.Stdout
 			}
-		} else {
-			err = fmt.Errorf("invalid log size %s", sz)
+		}
+
+		// Create the logger once we have a valid destination.
+		if c.logfile != nil && c.logger == nil {
+			var prefix string
+			if len(c.Name) > 0 {
+				prefix = fmt.Sprintf("[%s] ", c.Name)
+			}
+			c.logger = log.New(c.logfile, prefix, log.LstdFlags)
+		}
+
+		// Write before checking rotation so the message that crosses the
+		// threshold is never lost.
+		if c.logger != nil {
+			// Pass s as a plain %s argument to avoid re-interpreting any '%'
+			// characters in the already-formatted string.
+			c.logger.Printf("%s", s)
+		}
+
+		// Rotate after writing; next message will open a fresh file.
+		if c.logfile != os.Stdout && c.logfile != nil && c.logfileMaxSz > 0 {
+			fi, err := c.logfile.Stat()
+			if err != nil || fi.Size() > c.logfileMaxSz {
+				c.logfile.Close()
+				c.logfile = nil
+				c.logger = nil
+				os.Rename(c.logfilePath, c.logfilePath+".0")
+			}
 		}
 	}
-	return
+
+	if c.logfile != os.Stdout && c.logfile != nil {
+		c.logfile.Close()
+	}
+	c.logDoneC <- struct{}{}
 }
 
-// Run walks the command chain from RootCmd down to c, calling init functions,
-// then invokes c.run, and finally calls fini functions and closes log channels
-// on the way back.
+// Logf sends a formatted log line to the command's log channel.
+// The logger prefix (from c.Name) and timestamp are added automatically.
+func (c *Command) Logf(format string, v ...interface{}) {
+	if c.logC != nil {
+		c.logC <- fmt.Sprintf(format, v...)
+	}
+}
+
+func (c *Command) ErrLogf(format string, v ...interface{}) {
+	c.Logf("Error "+format, v...)
+}
+
+// --- Run ---------------------------------------------------------------------
+
+// Run walks the command chain from root down to c calling init functions,
+// invokes c.run, then calls fini and closes log channels on the way back.
 func (c *Command) Run() error {
 	var cmds []*Command
-	for pc := c; pc != nil; {
+	for pc := c; pc != nil; pc = pc.parent {
 		cmds = append(cmds, pc)
-		pc = pc.parent
 	}
 
 	var ch chan string
@@ -394,206 +576,98 @@ func (c *Command) Run() error {
 		if cmds[i].fini != nil {
 			cmds[i].fini(cmds[i])
 		}
-		// Only close channels that this command owns (has both logC and logDoneC).
+		// Only close channels that this command owns (logDoneC non-nil).
 		// Sub-commands that borrowed the parent's logC have logDoneC == nil.
 		if cmds[i].logC != nil && cmds[i].logDoneC != nil {
 			cmds[i].closeLogfile()
 		}
 	}
-
 	return err
 }
 
-// logfunc is the single goroutine that owns all file I/O for a Command's log
-// channel.  It opens the destination lazily on the first message, writes each
-// entry, and rotates the file after writing when the size limit is exceeded.
-// The goroutine exits cleanly when logC is closed (via closeLogfile).
-func logfunc(c *Command) {
-	for s := range c.logC {
-		// Open the log destination lazily on the first message.
-		if c.logfile == nil {
-			var err error
-			if c.logfilePath != "" {
-				c.logfile, err = os.OpenFile(c.logfilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if err != nil {
-					fmt.Printf("warn: failed to open log file '%s'\n", c.logfilePath)
-					c.logfile = nil
-				}
-			} else {
-				c.logfile = os.Stdout
-			}
-		}
-
-		// Create the logger once we have a valid destination.
-		if c.logfile != nil && c.logger == nil {
-			var prefix string
-			if len(c.Name) > 0 {
-				prefix = fmt.Sprintf("[%s] ", c.Name)
-			}
-			c.logger = log.New(c.logfile, prefix, log.LstdFlags)
-		}
-
-		// Write the current message before checking the size limit so the
-		// entry that crosses the threshold is never silently dropped.
-		if c.logger != nil {
-			// Use "%s" to avoid re-interpreting any '%' characters that
-			// appear in the already-formatted message string.
-			c.logger.Printf("%s", s)
-		}
-
-		// Rotate after writing so the triggering message stays in the old file.
-		if c.logfile != os.Stdout && c.logfile != nil && c.logfileMaxSz > 0 {
-			fi, err := c.logfile.Stat()
-			if err != nil || fi.Size() > c.logfileMaxSz {
-				c.logfile.Close()
-				c.logfile = nil
-				c.logger = nil
-				os.Rename(c.logfilePath, c.logfilePath+".0")
-			}
-		}
-	}
-
-	if c.logfile != os.Stdout && c.logfile != nil {
-		c.logfile.Close()
-	}
-	c.logDoneC <- struct{}{}
-}
-
-// Logf sends a formatted log line to the command's log channel.
-// The logger's prefix (derived from c.Name) and timestamp are prepended
-// automatically by the logging goroutine; do not include the command name
-// in the format string.
-func (c *Command) Logf(format string, v ...interface{}) {
-	if c.logC != nil {
-		c.logC <- fmt.Sprintf(format, v...)
-	}
-}
-
-func (c *Command) ErrLogf(format string, v ...interface{}) {
-	c.Logf("Error "+format, v...)
-}
-
-func (o *Option) SetIncrStep(step int) *Option {
-	if o.incrStep == 0 {
-		panic("cannot set increment step on non-increment Option")
-	}
-	if step == 0 {
-		panic("increment step cannot be 0")
-	}
-	o.incrStep = step
-	return o
-}
-
-func (o *Option) ReverseFlag() *Option {
-	if _, ok := o.v.(*clipBool); !ok {
-		panic("ReverseFlag on non-bool Option")
-	}
-	o.reverseFlag = true
-	return o
-}
-
-func (o *Option) Hide() *Option {
-	o.hide = true
-	return o
-}
-
-func (o *Option) Repeatable(r bool) *Option {
-	o.repeatable = r
-	return o
-}
-
-func (o *Option) MustSet() *Option {
-	o.status = optStMustSet
-	return o
-}
+// --- Argument parsing internals ----------------------------------------------
 
 func errf(format string, args ...interface{}) error {
-	return fmt.Errorf(fmt.Sprintf("CommandLine: %s", format), args...)
+	return fmt.Errorf("CommandLine: "+format, args...)
 }
 
 func setNoArgOption(o *Option) {
 	if o.incrStep != 0 {
 		if v_, ok := o.v.(*clipInt); ok {
-			v := (*int)(v_)
-			*v += o.incrStep
+			*(*int)(v_) += o.incrStep
 		} else {
-			panic("internal: none integer Option has non-zero incrStep")
+			panic("internal: non-integer Option has non-zero incrStep")
 		}
 	} else {
 		if v_, ok := o.v.(*clipBool); ok {
-			v := (*bool)(v_)
-			*v = !o.reverseFlag
+			*(*bool)(v_) = !o.reverseFlag
 		} else {
-			panic("internal: none boolean Option has zero incrStep")
+			panic("internal: non-bool Option has zero incrStep")
 		}
 	}
 }
 
-func parseLongOpt(c *Command, name string, str string) (consumed int, er error) {
+func parseLongOpt(c *Command, name, str string, helpOpt *Option) (consumed int, er error) {
 	kv := strings.Split(name, "=")
 	set := false
 	for _, o := range c.opts {
-		if o == &helpOption {
+		if o == helpOpt {
 			continue
 		}
-		if kv[0] == o.longName {
-			if o.status == optStSet && !o.repeatable {
-				er = errf("Option '%s' set more than once", kv[0])
+		if kv[0] != o.longName {
+			continue
+		}
+		if o.status == optStSet && !o.repeatable {
+			er = errf("Option '%s' set more than once", kv[0])
+			return
+		}
+		if o.hasArg {
+			if len(kv) == 2 {
+				if er = o.v.Parse(kv[1]); er != nil {
+					return
+				}
+				consumed = 1
+			} else if len(str) > 0 {
+				if er = o.v.Parse(str); er != nil {
+					return
+				}
+				consumed = 2
+			} else {
+				er = errf("option '%s' needs an argument", kv[0])
 				return
 			}
-			if o.hasArg {
-				if len(kv) == 2 {
-					if er = o.v.Parse(kv[1]); er != nil {
-						return
-					}
-					consumed = 1
-					set, o.status = true, optStSet
-				} else if len(str) > 0 {
-					if er = o.v.Parse(str); er != nil {
-						return
-					}
-					consumed = 2
-					set, o.status = true, optStSet
-				} else {
-					er = errf("optino '%s' need an argument", kv[0])
-					return
-				}
-			} else {
-				if len(kv) > 1 {
-					er = errf("optino '%s' does not take argument", kv[0])
-					return
-				}
-				setNoArgOption(o)
-				consumed = 1
-				set, o.status = true, optStSet
+		} else {
+			if len(kv) > 1 {
+				er = errf("option '%s' does not take an argument", kv[0])
+				return
 			}
+			setNoArgOption(o)
+			consumed = 1
 		}
-		if set {
-			break
-		}
+		set, o.status = true, optStSet
+		break
 	}
 
 	if !set {
-		if kv[0] == helpOption.longName {
-			HelpCommand(c, false)
-			os.Exit(0)
-		} else if kv[0] == "help-a" {
-			HelpCommand(c, true)
-			os.Exit(0)
+		if kv[0] == helpOpt.longName {
+			return 0, &errHelpRequest{cmd: c, all: false}
 		}
-		consumed = 0
+		if kv[0] == "help-a" {
+			return 0, &errHelpRequest{cmd: c, all: true}
+		}
 		if er == nil {
 			er = errf("Option '%s' not recognized", kv[0])
 		}
+		consumed = 0
 	}
 	return
 }
 
-func parseShortOpt(c *Command, name string, str string) (consumed int, er error) {
+func parseShortOpt(c *Command, name, str string, helpOpt *Option) (consumed int, er error) {
 	for len(name) > 0 {
 		var o *Option
 		for _, o_ := range c.opts {
-			if o_ == &helpOption {
+			if o_ == helpOpt {
 				continue
 			}
 			if name[0] == o_.shortName {
@@ -602,18 +676,16 @@ func parseShortOpt(c *Command, name string, str string) (consumed int, er error)
 			}
 		}
 		if o == nil || o.v == nil {
-			if name[0] == helpOption.shortName {
-				HelpCommand(c, false)
-				os.Exit(0)
+			if helpOpt.shortName != 0 && name[0] == helpOpt.shortName {
+				return 0, &errHelpRequest{cmd: c, all: false}
 			}
 			er = errf("Option '%s' not recognized", name[:1])
 			break
 		}
 		if o.status == optStSet && !o.repeatable {
-			er = errf("optino '%s' set more than once", name[:1])
+			er = errf("option '%s' set more than once", name[:1])
 			break
 		}
-
 		if o.hasArg {
 			if len(name) > 1 {
 				if er = o.v.Parse(name[1:]); er != nil {
@@ -630,7 +702,7 @@ func parseShortOpt(c *Command, name string, str string) (consumed int, er error)
 				o.status = optStSet
 				break
 			} else {
-				er = errf("Option '%s' need an argument", name[:1])
+				er = errf("Option '%s' needs an argument", name[:1])
 				break
 			}
 		} else {
@@ -662,10 +734,10 @@ func parsePositional(c *Command, str string) (consumed int, er error) {
 }
 
 func parseSubCommand(c *Command, str string) (consumed int, sc *Command, er error) {
-	var scTmp *Command
 	if len(c.subcmds) == 0 {
-		return 0, nil, nil // no sub-commands: treat remaining tokens as Arguments
+		return 0, nil, nil
 	}
+	var scTmp *Command
 	for _, s := range c.subcmds {
 		scTmp = nil
 		if len(s.Name) == len(str) {
@@ -679,45 +751,40 @@ func parseSubCommand(c *Command, str string) (consumed int, sc *Command, er erro
 		}
 		if scTmp != nil {
 			if sc != nil {
-				er = fmt.Errorf("ambiguous command '%s'", str)
-				sc = nil
-				break
-			} else {
-				sc = scTmp
+				return 0, nil, fmt.Errorf("ambiguous command '%s'", str)
 			}
+			sc = scTmp
 		}
 	}
 	if sc != nil {
 		consumed = 1
 	} else {
-		er = fmt.Errorf("'%s' not recognized.", str)
+		er = fmt.Errorf("'%s' not recognized", str)
 	}
 	return
 }
 
-func doParse(c *Command, ss []string) (consumed int, sc *Command, er error) {
+func doParse(c *Command, ss []string, helpOpt *Option) (consumed int, sc *Command, er error) {
 	arg0 := ss[0]
 	var arg1 string
 	if len(ss) > 1 {
 		arg1 = ss[1]
 	}
-
 	if arg0[0] == '-' {
 		if len(arg0) == 1 {
-			fmt.Println("warning: Option '-' ignored")
+			fmt.Println("warning: option '-' ignored")
 			consumed = 1
 		} else if arg0[1] == '-' {
 			if len(arg0) > 2 {
-				consumed, er = parseLongOpt(c, arg0[2:], arg1)
+				consumed, er = parseLongOpt(c, arg0[2:], arg1, helpOpt)
 			}
+			// bare "--" is handled in parseCommand before doParse is called
 		} else {
-			consumed, er = parseShortOpt(c, arg0[1:], arg1)
+			consumed, er = parseShortOpt(c, arg0[1:], arg1, helpOpt)
 		}
 	} else {
-		if consumed, er = parsePositional(c, arg0); er == nil {
-			if consumed == 0 {
-				consumed, sc, er = parseSubCommand(c, arg0)
-			}
+		if consumed, er = parsePositional(c, arg0); er == nil && consumed == 0 {
+			consumed, sc, er = parseSubCommand(c, arg0)
 		}
 	}
 	return
@@ -727,12 +794,12 @@ func checkMustSetOptions(c *Command) error {
 	for c != nil {
 		for _, o := range c.opts {
 			if o.status == optStMustSet {
-				return fmt.Errorf("Option '%s' not given", o.longName) //fixme
+				return fmt.Errorf("Option '%s' not given", o.longName)
 			}
 		}
 		for _, o := range c.positionals {
 			if o.status == optStMustSet {
-				return fmt.Errorf("positional Option '%s' not given", o.longName)
+				return fmt.Errorf("positional '%s' not given", o.longName)
 			}
 		}
 		c = c.parent
@@ -740,20 +807,25 @@ func checkMustSetOptions(c *Command) error {
 	return nil
 }
 
-func parseCommand(c *Command, args []string) (*Command, error) {
+func parseCommand(c *Command, args []string, helpOpt *Option) (*Command, error) {
 	var err error
 	for len(args) > 0 {
+		// "--" ends option processing; remainder goes verbatim into Arguments.
+		if args[0] == "--" {
+			c.Arguments = args[1:]
+			break
+		}
+
 		n := 1
 		if len(args) > 1 {
 			n = 2
 		}
-		consumed, sc, er := doParse(c, args[:n])
+		consumed, sc, er := doParse(c, args[:n], helpOpt)
 		if er != nil {
 			err = er
 			c = nil
 			break
 		}
-
 		if consumed > 0 {
 			args = args[consumed:]
 			if sc != nil {
@@ -772,56 +844,11 @@ func parseCommand(c *Command, args []string) (*Command, error) {
 	return c, err
 }
 
-// Parse processes the argument vector and returns the matched [Command].
-//
-// If args is nil or empty, os.Args is used.  Element [0] is always treated
-// as the program name and skipped during option parsing; the populated [Args]
-// slice includes argv[0] at index 0.
-//
-// Parse starts the background logging goroutine the first time it is called
-// (or after a prior [Close] / [Command.Run]).  Call [Close] if you exit
-// without calling [Command.Run] to avoid a goroutine leak.
-func Parse(args []string) (*Command, error) {
-	// Start the logging goroutine once; it remains alive until closeLogfile is
-	// called by Run or Close.  A nil logC means either this is the first call
-	// or the previous goroutine was already stopped.
-	if RootCmd.logC == nil {
-		RootCmd.logC = make(chan string, 5)
-		RootCmd.logDoneC = make(chan struct{})
-		go logfunc(&RootCmd)
-	}
-
-	// Guard against duplicate helpOption entries if Parse is called more than
-	// once without a full reset (e.g. in test suites).
-	hasHelp := false
-	for _, o := range RootCmd.opts {
-		if o == &helpOption {
-			hasHelp = true
-			break
-		}
-	}
-	if !hasHelp && (helpOption.shortName != 0 || len(helpOption.longName) > 0) {
-		RootCmd.opts = append(RootCmd.opts, &helpOption)
-	}
-
-	if len(args) == 0 {
-		args = os.Args
-	}
-	// Reset Args so repeated Parse calls do not accumulate entries from
-	// previous invocations.
-	Args = nil
-	for _, s := range args {
-		if len(s) > 0 {
-			Args = append(Args, s)
-		}
-	}
-	return parseCommand(&RootCmd, Args[1:])
-}
+// --- Help / formatting -------------------------------------------------------
 
 func FormatText(text string, width, indent, indentFrom uint) string {
 	var buf bytes.Buffer
 	indstr := "\n"
-
 	if indent > 0 {
 		buf.WriteByte('\n')
 		for i := 0; i < int(indent); i++ {
@@ -829,12 +856,10 @@ func FormatText(text string, width, indent, indentFrom uint) string {
 		}
 		indstr = buf.String()
 		buf.Reset()
-
 		if indentFrom == 0 {
 			buf.Write([]byte(indstr[1:]))
 		}
 	}
-
 	var w, wlen int
 	var word string
 	for len(text) > 0 {
@@ -847,16 +872,14 @@ func FormatText(text string, width, indent, indentFrom uint) string {
 			word = text
 			text = ""
 		}
-
 		if w+wlen > int(width)+1 {
-			buf.Write([]byte(indstr))
+			buf.WriteString(indstr)
 			w = wlen
 		} else {
 			w += wlen
 		}
-		buf.Write([]byte(word))
+		buf.WriteString(word)
 	}
-
 	return buf.String()
 }
 
@@ -867,7 +890,6 @@ func prtList(lst [][2]string, kind string) (n int) {
 			w = len(e[0])
 		}
 	}
-
 	if w < 20 {
 		w = 20
 	}
@@ -891,20 +913,19 @@ func prtList(lst [][2]string, kind string) (n int) {
 	return n
 }
 
-func prtOptions(os []*Option, kind string, all bool) {
+func prtOptions(opts []*Option, kind string, all bool, helpOpt *Option) {
 	var buf bytes.Buffer
 	var lst [][2]string
 	var idx int
-
-	for _, o := range os {
+	for _, o := range opts {
 		if !all && o.hide {
 			continue
 		}
-		if o.shortName == helpOption.shortName && o.longName == helpOption.longName {
+		if o.shortName == helpOpt.shortName && o.longName == helpOpt.longName {
 			continue
 		}
 		buf.Reset()
-		buf.Write([]byte("  "))
+		buf.WriteString("  ")
 		if o.shortName != 0 {
 			buf.WriteByte('-')
 			buf.WriteByte(o.shortName)
@@ -914,73 +935,64 @@ func prtOptions(os []*Option, kind string, all bool) {
 				buf.WriteByte(',')
 			}
 			if kind == "Options" {
-				buf.Write([]byte(fmt.Sprintf("--%s", o.longName)))
+				fmt.Fprintf(&buf, "--%s", o.longName)
 			} else {
 				idx++
-				buf.Write([]byte(fmt.Sprintf("%d. %s", idx, o.longName)))
+				fmt.Fprintf(&buf, "%d. %s", idx, o.longName)
 			}
 		}
 		if o.hasArg {
 			if o.argName == "" {
 				o.argName = "ARG"
 			}
-			buf.Write([]byte(fmt.Sprintf(" <%s>", o.argName)))
+			fmt.Fprintf(&buf, " <%s>", o.argName)
 		}
 		ostr := buf.String()
 
 		buf.Reset()
-		buf.Write([]byte(o.desc))
+		buf.WriteString(o.desc)
 		if o.v != nil {
 			if o.status == optStDefault {
-				dft := o.v.String()
-				if len(dft) > 0 {
-					buf.Write([]byte(fmt.Sprintf(" (default: %s)", dft)))
+				if dft := o.v.String(); len(dft) > 0 {
+					fmt.Fprintf(&buf, " (default: %s)", dft)
 				}
 			} else if o.status == optStMustSet {
-				buf.Write([]byte(" (must set)"))
+				buf.WriteString(" (must set)")
 			}
 		}
-
-		desc := buf.String()
-		lst = append(lst, [2]string{ostr, desc})
+		lst = append(lst, [2]string{ostr, buf.String()})
 	}
-
 	if prtList(lst, kind) > 0 {
 		fmt.Println()
 	}
 }
 
-func HelpCommand(c *Command, all bool) {
-	var lst [][2]string
-	if c == nil {
-		c = &RootCmd
-	}
-	if c == &RootCmd {
-		fmt.Printf("%s\n\n", FormatText(progInfo, 80, 0, 0))
-	} else {
-		s := c.longDesc
-		if s == "" {
-			s = c.desc
+// parseSize converts a human-readable size string to bytes.
+// Recognised suffixes: k/K (×1024), m/M (×1024²), g/G (×1024³).
+// A plain integer with no suffix is returned as-is.
+// An empty string returns 0 (callers interpret 0 as "no limit").
+func parseSize(sz string) (n int64, err error) {
+	var factor int64
+	if len(sz) > 0 {
+		switch sz[len(sz)-1] {
+		case 'k', 'K':
+			factor = 1024
+		case 'm', 'M':
+			factor = 1024 * 1024
+		case 'g', 'G':
+			factor = 1024 * 1024 * 1024
 		}
-		lst = append(lst, [2]string{c.Name, s})
-		if prtList(lst, "") > 0 {
-			fmt.Println()
+		if factor > 0 {
+			sz = sz[:len(sz)-1]
 		}
-		lst = nil
-	}
-	prtOptions(c.opts, "Options", all)
-	prtOptions(c.positionals, "Positionals", all)
-
-	for _, sc := range c.subcmds {
-		if all || !sc.hide {
-			lst = append(lst, [2]string{fmt.Sprintf("  %s", sc.Name), sc.desc})
+		n, err = strconv.ParseInt(sz, 0, 64)
+		if err == nil {
+			if factor > 0 {
+				n *= factor
+			}
+		} else {
+			err = fmt.Errorf("invalid log size %s", sz)
 		}
 	}
-	if prtList(lst, "Sub-Commands") > 0 {
-		fmt.Println()
-	}
-}
-
-func ProgDescription(desc string) {
-	progInfo = desc
+	return
 }

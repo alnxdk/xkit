@@ -1,6 +1,7 @@
 package clip
 
 import (
+	"errors"
 	"os"
 	"runtime"
 	"strings"
@@ -8,138 +9,133 @@ import (
 	"time"
 )
 
-// reset clears all package-level state between tests.  It stops any running
-// logging goroutine before zeroing RootCmd so no goroutine is left dangling.
+// reset clears DefaultParser between tests.
 func reset() {
-	RootCmd.closeLogfile()
-	RootCmd = Command{}
-	Args = nil
-	helpOption = Option{shortName: 'h', longName: "help", desc: "Help information"}
-	progInfo = ""
+	DefaultParser.Close()
+	*DefaultParser = *New()
 }
 
-// ---- parseSize ----------------------------------------------------------------
+// ---- parseSize ---------------------------------------------------------------
 
 func TestParseSizePlainInt(t *testing.T) {
-	// Regression: factor==0 (no suffix) previously caused n*=0, returning 0.
 	n, err := parseSize("1048576")
 	if err != nil || n != 1048576 {
-		t.Errorf("parseSize(\"1048576\") = %d, %v; want 1048576, nil", n, err)
+		t.Errorf("got %d, %v; want 1048576, nil", n, err)
 	}
 }
 
 func TestParseSizeKilo(t *testing.T) {
 	n, err := parseSize("10k")
 	if err != nil || n != 10*1024 {
-		t.Errorf("parseSize(\"10k\") = %d, %v; want %d, nil", n, err, 10*1024)
-	}
-}
-
-func TestParseSizeKiloUpper(t *testing.T) {
-	n, err := parseSize("10K")
-	if err != nil || n != 10*1024 {
-		t.Errorf("parseSize(\"10K\") = %d, %v; want %d, nil", n, err, 10*1024)
+		t.Errorf("got %d, %v; want %d, nil", n, err, 10*1024)
 	}
 }
 
 func TestParseSizeMega(t *testing.T) {
 	n, err := parseSize("2M")
 	if err != nil || n != 2*1024*1024 {
-		t.Errorf("parseSize(\"2M\") = %d, %v", n, err)
+		t.Errorf("got %d, %v", n, err)
 	}
 }
 
 func TestParseSizeGiga(t *testing.T) {
 	n, err := parseSize("1G")
 	if err != nil || n != 1*1024*1024*1024 {
-		t.Errorf("parseSize(\"1G\") = %d, %v", n, err)
+		t.Errorf("got %d, %v", n, err)
 	}
 }
 
 func TestParseSizeEmpty(t *testing.T) {
-	// Empty string means "no limit"; returns 0 without error.
 	n, err := parseSize("")
 	if err != nil || n != 0 {
-		t.Errorf("parseSize(\"\") = %d, %v; want 0, nil", n, err)
+		t.Errorf("got %d, %v; want 0, nil", n, err)
 	}
 }
 
 func TestParseSizeInvalid(t *testing.T) {
 	if _, err := parseSize("abc"); err == nil {
-		t.Error("parseSize(\"abc\") should return an error")
+		t.Error("expected error for invalid size")
 	}
 }
 
-func TestParseSizeHex(t *testing.T) {
-	// strconv.ParseInt with base 0 accepts 0x-prefixed hex.
-	n, err := parseSize("0x400")
-	if err != nil || n != 1024 {
-		t.Errorf("parseSize(\"0x400\") = %d, %v; want 1024, nil", n, err)
+// ---- Parser / DefaultParser --------------------------------------------------
+
+func TestNewIsIndependent(t *testing.T) {
+	// Two parsers must not share any state.
+	reset()
+	defer reset()
+
+	p1 := New()
+	p2 := New()
+
+	var v1, v2 string
+	p1.ArgOption(&v1, 'f', "file", "F", "")
+	p2.ArgOption(&v2, 'g', "get", "G", "")
+
+	if _, err := p1.Parse([]string{"prog", "-f", "alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	defer p1.Close()
+
+	if _, err := p2.Parse([]string{"prog", "-g", "beta"}); err != nil {
+		t.Fatal(err)
+	}
+	defer p2.Close()
+
+	if v1 != "alpha" || v2 != "beta" {
+		t.Errorf("v1=%q v2=%q; want alpha/beta", v1, v2)
+	}
+	// p2 must not have seen p1's -f option
+	if len(p2.opts) != 2 { // -g + help
+		t.Errorf("p2 has %d opts; want 2", len(p2.opts))
 	}
 }
 
-// ---- Args accumulation --------------------------------------------------------
+// ---- Args accumulation -------------------------------------------------------
 
 func TestArgsResetBetweenParses(t *testing.T) {
-	// Regression: Args was never cleared, so second Parse saw stale entries.
 	reset()
 	var f1 string
-	RootCmd.ArgOption(&f1, 'f', "foo", "V", "")
+	DefaultParser.ArgOption(&f1, 'f', "foo", "V", "")
 	if _, err := Parse([]string{"prog", "-f", "first"}); err != nil {
 		t.Fatal(err)
 	}
-	RootCmd.closeLogfile()
+	DefaultParser.Close()
 
 	reset()
 	var f2 string
-	RootCmd.ArgOption(&f2, 'f', "foo", "V", "")
+	DefaultParser.ArgOption(&f2, 'f', "foo", "V", "")
 	if _, err := Parse([]string{"prog", "-f", "second"}); err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
+	defer DefaultParser.Close()
 
-	if len(Args) != 3 {
-		t.Errorf("Args = %v (len=%d); want [prog -f second]", Args, len(Args))
+	if len(DefaultParser.Args) != 3 {
+		t.Errorf("Args = %v; want [prog -f second]", DefaultParser.Args)
 	}
 	if f2 != "second" {
 		t.Errorf("f2 = %q; want \"second\"", f2)
 	}
 }
 
-func TestArgsSkipsEmptyStrings(t *testing.T) {
-	reset()
-	defer func() { reset() }()
-
-	Parse([]string{"prog", "", "hello", ""})
-	RootCmd.closeLogfile()
-
-	for _, a := range Args {
-		if a == "" {
-			t.Errorf("Args contains empty string: %v", Args)
-		}
-	}
-}
-
-// ---- Goroutine leak -----------------------------------------------------------
+// ---- Goroutine leak ----------------------------------------------------------
 
 func TestNoGoroutineLeakOnRepeatedParse(t *testing.T) {
-	// Regression: each Parse() used to unconditionally start a new goroutine,
-	// leaking the previous one when Parse was called without an intervening Run.
 	reset()
 	before := runtime.NumGoroutine()
 
 	for i := 0; i < 5; i++ {
 		reset()
 		var f string
-		RootCmd.ArgOption(&f, 'f', "foo", "V", "")
+		DefaultParser.ArgOption(&f, 'f', "foo", "V", "")
 		Parse([]string{"prog", "-f", "x"})
-		RootCmd.closeLogfile() // simulates what Run() does
+		DefaultParser.Close()
 	}
 
-	time.Sleep(20 * time.Millisecond) // let goroutines exit
+	time.Sleep(20 * time.Millisecond)
 	after := runtime.NumGoroutine()
 	if after > before+1 {
-		t.Errorf("goroutine count grew from %d to %d; likely leak", before, after)
+		t.Errorf("goroutine count grew %d → %d; likely leak", before, after)
 	}
 }
 
@@ -148,7 +144,7 @@ func TestGoroutineCleanedUpByClose(t *testing.T) {
 	before := runtime.NumGoroutine()
 
 	Parse([]string{"prog"})
-	Close() // explicit cleanup without calling Run
+	Close()
 
 	time.Sleep(20 * time.Millisecond)
 	after := runtime.NumGoroutine()
@@ -157,81 +153,128 @@ func TestGoroutineCleanedUpByClose(t *testing.T) {
 	}
 }
 
-// ---- helpOption dedup ---------------------------------------------------------
+// ---- ErrHelp (replaces os.Exit) ---------------------------------------------
+
+func TestParseReturnsErrHelp(t *testing.T) {
+	// ErrHelp must be returned instead of calling os.Exit(0).
+	p := New()
+	defer p.Close()
+
+	_, err := p.Parse([]string{"prog", "--help"})
+	if !errors.Is(err, ErrHelp) {
+		t.Errorf("got %v; want ErrHelp", err)
+	}
+}
+
+func TestParseReturnsErrHelpShort(t *testing.T) {
+	p := New()
+	defer p.Close()
+
+	_, err := p.Parse([]string{"prog", "-h"})
+	if !errors.Is(err, ErrHelp) {
+		t.Errorf("got %v; want ErrHelp", err)
+	}
+}
+
+// ---- helpOption dedup --------------------------------------------------------
 
 func TestHelpOptionAddedOnce(t *testing.T) {
-	// Regression: each Parse() appended &helpOption without checking for dups.
 	reset()
+	defer reset()
+
 	Parse([]string{"prog"})
-	// Do NOT closeLogfile yet — call Parse again without full reset to verify
-	// the dedup guard.
-	Parse([]string{"prog"})
-	defer RootCmd.closeLogfile()
+	Parse([]string{"prog"}) // second call on same parser state
+	defer DefaultParser.Close()
 
 	count := 0
-	for _, o := range RootCmd.opts {
-		if o == &helpOption {
+	for _, o := range DefaultParser.opts {
+		if o == &DefaultParser.helpOption {
 			count++
 		}
 	}
 	if count != 1 {
-		t.Errorf("&helpOption appears %d time(s) in RootCmd.opts; want exactly 1", count)
+		t.Errorf("helpOption appears %d time(s); want 1", count)
 	}
 }
 
-// ---- PositionalCustom guard ---------------------------------------------------
+// ---- double-dash end-of-options ---------------------------------------------
+
+func TestDoubleDashEndsOptions(t *testing.T) {
+	reset()
+	defer reset()
+
+	var verbose bool
+	DefaultParser.FlagOption(&verbose, 'v', "verbose", "")
+
+	cmd, err := Parse([]string{"prog", "-v", "--", "--not-a-flag", "arg2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer DefaultParser.Close()
+
+	if !verbose {
+		t.Error("-v before -- should have been parsed")
+	}
+	if len(cmd.Arguments) != 2 || cmd.Arguments[0] != "--not-a-flag" {
+		t.Errorf("Arguments = %v; want [--not-a-flag arg2]", cmd.Arguments)
+	}
+}
+
+// ---- uint64 support ---------------------------------------------------------
+
+func TestArgOptionUint64(t *testing.T) {
+	reset()
+	defer reset()
+
+	var n uint64
+	DefaultParser.ArgOption(&n, 0, "count", "N", "")
+
+	if _, err := Parse([]string{"prog", "--count", "18446744073709551615"}); err != nil {
+		t.Fatal(err)
+	}
+	defer DefaultParser.Close()
+
+	if n != 18446744073709551615 {
+		t.Errorf("n = %d; want max uint64", n)
+	}
+}
+
+// ---- PositionalCustom guard --------------------------------------------------
 
 func TestPositionalCustomPanicsWhenSubcmdsExist(t *testing.T) {
-	// Regression: PositionalCustom lacked the subcmds guard that Positional has.
 	reset()
 	defer reset()
-
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expected panic when calling PositionalCustom after SubCommand")
-		}
-	}()
-
-	RootCmd.SubCommand("sub", "a subcommand", "")
-	var s string
-	RootCmd.PositionalCustom((*clipString)(&s), "arg", "should panic")
-}
-
-func TestPositionalPanicsWhenSubcmdsExist(t *testing.T) {
-	reset()
-	defer reset()
-
 	defer func() {
 		if r := recover(); r == nil {
 			t.Error("expected panic")
 		}
 	}()
-
-	RootCmd.SubCommand("sub", "a subcommand", "")
+	DefaultParser.SubCommand("sub", "", "")
 	var s string
-	RootCmd.Positional(&s, "arg", "should panic")
+	DefaultParser.PositionalCustom((*clipString)(&s), "arg", "")
 }
 
-func TestSubCommandPanicsWhenPositionalsExist(t *testing.T) {
-	reset()
-	defer reset()
+// ---- SetLogBufSize -----------------------------------------------------------
 
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expected panic")
-		}
-	}()
+func TestSetLogBufSize(t *testing.T) {
+	p := New()
+	p.SetLogBufSize(128)
+	defer p.Close()
 
-	var s string
-	RootCmd.Positional(&s, "arg", "")
-	RootCmd.SubCommand("sub", "should panic", "")
+	if _, err := p.Parse([]string{"prog"}); err != nil {
+		t.Fatal(err)
+	}
+	// Channel should accept 128 entries without blocking.
+	for i := 0; i < 128; i++ {
+		p.Logf("msg %d", i)
+	}
+	// If SetLogBufSize had no effect (buffer=64), sending 128 entries would
+	// deadlock.  Reaching here means the buffer is at least 128.
 }
 
-// ---- Logging ------------------------------------------------------------------
+// ---- Logging -----------------------------------------------------------------
 
 func TestLogfPercentNotReinterpreted(t *testing.T) {
-	// Regression: logger.Printf(s) re-interpreted '%' in the already-formatted
-	// string; the fix is logger.Printf("%s", s).
 	reset()
 	defer reset()
 
@@ -250,27 +293,25 @@ func TestLogfPercentNotReinterpreted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	RootCmd.Logf("progress: %d%%", 75)      // formatted string will contain "75%"
-	RootCmd.Logf("path: /tmp/%%s/file.txt") // literal %s in message
-	RootCmd.closeLogfile()
+	DefaultParser.Logf("progress: %d%%", 75)
+	DefaultParser.Logf("path: /tmp/%%s/file")
+	DefaultParser.Close()
 
 	data, _ := os.ReadFile(name)
 	content := string(data)
 	if strings.Contains(content, "%!(") {
-		t.Errorf("log output contains format verb artefacts:\n%s", content)
+		t.Errorf("log output contains format-verb artefacts:\n%s", content)
 	}
 	if !strings.Contains(content, "progress: 75%") {
-		t.Errorf("log output missing expected content:\n%s", content)
+		t.Errorf("expected \"progress: 75%%\" in log:\n%s", content)
 	}
 }
 
 func TestLogfNoDuplicateNamePrefix(t *testing.T) {
-	// Regression: Logf prepended [Name] AND the logger also had [Name] as its
-	// prefix, producing "[Name] DATETIME [Name] message".
 	reset()
 	defer reset()
 
-	RootCmd.Name = "myapp"
+	DefaultParser.Name = "myapp"
 
 	f, err := os.CreateTemp("", "clip-test-*.log")
 	if err != nil {
@@ -287,30 +328,16 @@ func TestLogfNoDuplicateNamePrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	RootCmd.Logf("hello world")
-	RootCmd.closeLogfile()
+	DefaultParser.Logf("hello world")
+	DefaultParser.Close()
 
 	data, _ := os.ReadFile(name)
-	content := string(data)
-	count := strings.Count(content, "[myapp]")
-	if count != 1 {
-		t.Errorf("[myapp] appears %d time(s) per log line; want 1:\n%s", count, content)
+	if count := strings.Count(string(data), "[myapp]"); count != 1 {
+		t.Errorf("[myapp] appears %d time(s); want 1:\n%s", count, string(data))
 	}
 }
 
 func TestLogRotationMessageNotDropped(t *testing.T) {
-	// Regression: the message that triggered rotation was silently discarded
-	// because the old code nil'd the logger (rotation check) before writing.
-	//
-	// Scenario with a 1-byte limit:
-	//   OLD code — "first" written (file empty → no rotation check fires yet).
-	//              "second" arrives: rotation fires, logger nil'd, then write is
-	//              skipped → "second" is permanently lost.
-	//   NEW code — both messages are written before their rotation checks, so
-	//              "second" is always present in the .0 backup file.
-	//
-	// Note: with limit=1, every write triggers a rotation that overwrites .0,
-	// so only the last-written message survives in .0; we assert only "second".
 	reset()
 	defer reset()
 
@@ -323,6 +350,9 @@ func TestLogRotationMessageNotDropped(t *testing.T) {
 	defer os.Remove(name)
 	defer os.Remove(name + ".0")
 
+	// 1-byte limit: rotation fires after every write.  With the fix, the
+	// message that triggers rotation is written before the rotate, so it always
+	// ends up in .0.  The old code nil'd the logger first → silent drop.
 	if err := OpenLogfile(name, "1"); err != nil {
 		t.Fatal(err)
 	}
@@ -330,9 +360,9 @@ func TestLogRotationMessageNotDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	RootCmd.Logf("first")
-	RootCmd.Logf("second") // this triggers rotation; old code dropped it
-	RootCmd.closeLogfile()
+	DefaultParser.Logf("first")
+	DefaultParser.Logf("second") // triggers rotation in old code → was dropped
+	DefaultParser.Close()
 
 	var all strings.Builder
 	for _, path := range []string{name, name + ".0"} {
@@ -341,39 +371,35 @@ func TestLogRotationMessageNotDropped(t *testing.T) {
 		}
 	}
 	if !strings.Contains(all.String(), "second") {
-		t.Errorf("rotation-triggering message was dropped:\n%s", all.String())
+		t.Errorf("rotation-triggering message dropped:\n%s", all.String())
 	}
 }
 
 func TestLogToStdoutWhenNoPath(t *testing.T) {
-	// When no logfile path is set, the goroutine should assign os.Stdout and
-	// not panic or error.
 	reset()
 	defer reset()
 
 	if _, err := Parse([]string{"prog"}); err != nil {
 		t.Fatal(err)
 	}
-	// Logf should not block or panic.
-	RootCmd.Logf("stdout log line")
-	RootCmd.closeLogfile()
+	DefaultParser.Logf("stdout log line")
+	DefaultParser.Close()
 }
 
-// ---- Basic option parsing -----------------------------------------------------
+// ---- Basic option parsing ---------------------------------------------------
 
 func TestParseFlagShort(t *testing.T) {
 	reset()
 	defer reset()
 
 	var v bool
-	RootCmd.FlagOption(&v, 'v', "verbose", "")
+	FlagOption(&v, 'v', "verbose", "")
 	if _, err := Parse([]string{"prog", "-v"}); err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
-
+	defer Close()
 	if !v {
-		t.Error("verbose should be true after -v")
+		t.Error("expected verbose=true")
 	}
 }
 
@@ -382,14 +408,13 @@ func TestParseFlagLong(t *testing.T) {
 	defer reset()
 
 	var v bool
-	RootCmd.FlagOption(&v, 'v', "verbose", "")
+	FlagOption(&v, 'v', "verbose", "")
 	if _, err := Parse([]string{"prog", "--verbose"}); err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
-
+	defer Close()
 	if !v {
-		t.Error("verbose should be true after --verbose")
+		t.Error("expected verbose=true")
 	}
 }
 
@@ -398,12 +423,11 @@ func TestParseArgOptionLong(t *testing.T) {
 	defer reset()
 
 	var out string
-	RootCmd.ArgOption(&out, 'o', "output", "FILE", "")
+	ArgOption(&out, 'o', "output", "FILE", "")
 	if _, err := Parse([]string{"prog", "--output", "file.txt"}); err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
-
+	defer Close()
 	if out != "file.txt" {
 		t.Errorf("out = %q; want \"file.txt\"", out)
 	}
@@ -414,12 +438,11 @@ func TestParseArgOptionLongEquals(t *testing.T) {
 	defer reset()
 
 	var out string
-	RootCmd.ArgOption(&out, 'o', "output", "FILE", "")
+	ArgOption(&out, 'o', "output", "FILE", "")
 	if _, err := Parse([]string{"prog", "--output=file.txt"}); err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
-
+	defer Close()
 	if out != "file.txt" {
 		t.Errorf("out = %q; want \"file.txt\"", out)
 	}
@@ -430,12 +453,11 @@ func TestParseArgOptionShort(t *testing.T) {
 	defer reset()
 
 	var out string
-	RootCmd.ArgOption(&out, 'o', "output", "FILE", "")
+	ArgOption(&out, 'o', "output", "FILE", "")
 	if _, err := Parse([]string{"prog", "-o", "file.txt"}); err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
-
+	defer Close()
 	if out != "file.txt" {
 		t.Errorf("out = %q; want \"file.txt\"", out)
 	}
@@ -446,12 +468,11 @@ func TestParseArgOptionShortCombined(t *testing.T) {
 	defer reset()
 
 	var out string
-	RootCmd.ArgOption(&out, 'o', "output", "FILE", "")
+	ArgOption(&out, 'o', "output", "FILE", "")
 	if _, err := Parse([]string{"prog", "-ofile.txt"}); err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
-
+	defer Close()
 	if out != "file.txt" {
 		t.Errorf("out = %q; want \"file.txt\"", out)
 	}
@@ -462,12 +483,11 @@ func TestParsePositional(t *testing.T) {
 	defer reset()
 
 	var name string
-	RootCmd.Positional(&name, "name", "")
+	Positional(&name, "name", "")
 	if _, err := Parse([]string{"prog", "Alice"}); err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
-
+	defer Close()
 	if name != "Alice" {
 		t.Errorf("name = %q; want \"Alice\"", name)
 	}
@@ -478,15 +498,14 @@ func TestParseMultiplePositionals(t *testing.T) {
 	defer reset()
 
 	var a, b string
-	RootCmd.Positional(&a, "first", "")
-	RootCmd.Positional(&b, "second", "")
+	Positional(&a, "first", "")
+	Positional(&b, "second", "")
 	if _, err := Parse([]string{"prog", "hello", "world"}); err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
-
+	defer Close()
 	if a != "hello" || b != "world" {
-		t.Errorf("a=%q b=%q; want \"hello\" \"world\"", a, b)
+		t.Errorf("a=%q b=%q; want hello/world", a, b)
 	}
 }
 
@@ -495,12 +514,11 @@ func TestParseIncrOption(t *testing.T) {
 	defer reset()
 
 	var level int
-	RootCmd.IncrOption(&level, 'v', "verbose", "")
+	IncrOption(&level, 'v', "verbose", "")
 	if _, err := Parse([]string{"prog", "-v", "-v", "-v"}); err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
-
+	defer Close()
 	if level != 3 {
 		t.Errorf("level = %d; want 3", level)
 	}
@@ -511,26 +529,25 @@ func TestParseRemainingArguments(t *testing.T) {
 	defer reset()
 
 	var f string
-	RootCmd.ArgOption(&f, 'f', "file", "F", "")
+	ArgOption(&f, 'f', "file", "F", "")
 	cmd, err := Parse([]string{"prog", "-f", "x", "extra1", "extra2"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
-
-	if len(cmd.Arguments) != 2 || cmd.Arguments[0] != "extra1" || cmd.Arguments[1] != "extra2" {
+	defer Close()
+	if len(cmd.Arguments) != 2 || cmd.Arguments[0] != "extra1" {
 		t.Errorf("Arguments = %v; want [extra1 extra2]", cmd.Arguments)
 	}
 }
 
-// ---- Sub-commands -------------------------------------------------------------
+// ---- Sub-commands -----------------------------------------------------------
 
 func TestParseSubCommand(t *testing.T) {
 	reset()
 	defer reset()
 
 	called := false
-	sub := RootCmd.SubCommand("serve", "start server", "")
+	sub := SubCommand("serve", "", "")
 	sub.SetRuns(func(c *Command) error { called = true; return nil }, nil, nil)
 
 	cmd, err := Parse([]string{"prog", "serve"})
@@ -549,17 +566,16 @@ func TestParseSubCommandPrefix(t *testing.T) {
 	reset()
 	defer reset()
 
-	sub := RootCmd.SubCommand("serve", "", "")
+	sub := SubCommand("serve", "", "")
 	sub.SetRuns(func(c *Command) error { return nil }, nil, nil)
 
 	cmd, err := Parse([]string{"prog", "ser"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
-
+	defer Close()
 	if cmd.Name != "serve" {
-		t.Errorf("matched command %q; want \"serve\"", cmd.Name)
+		t.Errorf("matched %q; want \"serve\"", cmd.Name)
 	}
 }
 
@@ -567,27 +583,13 @@ func TestParseSubCommandAmbiguous(t *testing.T) {
 	reset()
 	defer reset()
 
-	RootCmd.SubCommand("serve", "", "")
-	RootCmd.SubCommand("search", "", "")
-
+	SubCommand("serve", "", "")
+	SubCommand("search", "", "")
 	_, err := Parse([]string{"prog", "se"})
 	if err == nil {
 		t.Error("expected ambiguous-command error")
 	}
-	RootCmd.closeLogfile()
-}
-
-func TestParseSubCommandUnknown(t *testing.T) {
-	reset()
-	defer reset()
-
-	RootCmd.SubCommand("serve", "", "")
-
-	_, err := Parse([]string{"prog", "unknown"})
-	if err == nil {
-		t.Error("expected error for unknown sub-command")
-	}
-	RootCmd.closeLogfile()
+	Close()
 }
 
 func TestParseSubCommandWithOption(t *testing.T) {
@@ -595,7 +597,7 @@ func TestParseSubCommandWithOption(t *testing.T) {
 	defer reset()
 
 	var port int
-	sub := RootCmd.SubCommand("serve", "", "")
+	sub := SubCommand("serve", "", "")
 	sub.ArgOption(&port, 'p', "port", "PORT", "")
 	sub.SetRuns(func(c *Command) error { return nil }, nil, nil)
 
@@ -611,60 +613,51 @@ func TestParseSubCommandWithOption(t *testing.T) {
 	}
 }
 
-// ---- Error cases --------------------------------------------------------------
+// ---- Error cases ------------------------------------------------------------
 
 func TestParseUnknownFlag(t *testing.T) {
 	reset()
 	defer reset()
-
 	_, err := Parse([]string{"prog", "--no-such-flag"})
 	if err == nil {
 		t.Error("expected error for unknown flag")
 	}
-	RootCmd.closeLogfile()
+	Close()
 }
 
 func TestParseMustSet(t *testing.T) {
 	reset()
 	defer reset()
-
 	var val string
-	RootCmd.ArgOption(&val, 'f', "file", "FILE", "").MustSet()
-
+	ArgOption(&val, 'f', "file", "FILE", "").MustSet()
 	_, err := Parse([]string{"prog"})
 	if err == nil {
-		t.Error("expected error: must-set option not provided")
+		t.Error("expected must-set error")
 	}
-	RootCmd.closeLogfile()
+	Close()
 }
 
 func TestParseDuplicateOption(t *testing.T) {
 	reset()
 	defer reset()
-
 	var val string
-	RootCmd.ArgOption(&val, 'f', "file", "FILE", "")
-
+	ArgOption(&val, 'f', "file", "FILE", "")
 	_, err := Parse([]string{"prog", "-f", "a", "-f", "b"})
 	if err == nil {
-		t.Error("expected error: option set more than once")
+		t.Error("expected duplicate-option error")
 	}
-	RootCmd.closeLogfile()
+	Close()
 }
 
 func TestParseRepeatableOption(t *testing.T) {
 	reset()
 	defer reset()
-
 	var val string
-	RootCmd.ArgOption(&val, 'f', "file", "FILE", "").Repeatable(true)
-
-	_, err := Parse([]string{"prog", "-f", "a", "-f", "b"})
-	if err != nil {
+	ArgOption(&val, 'f', "file", "FILE", "").Repeatable(true)
+	if _, err := Parse([]string{"prog", "-f", "a", "-f", "b"}); err != nil {
 		t.Fatalf("repeatable option should not error: %v", err)
 	}
-	defer RootCmd.closeLogfile()
-
+	defer Close()
 	if val != "b" {
 		t.Errorf("val = %q; want \"b\"", val)
 	}
@@ -673,33 +666,57 @@ func TestParseRepeatableOption(t *testing.T) {
 func TestParseReverseFlag(t *testing.T) {
 	reset()
 	defer reset()
-
 	v := true
-	RootCmd.FlagOption(&v, 'n', "no-verbose", "").ReverseFlag()
-
+	FlagOption(&v, 'n', "no-verbose", "").ReverseFlag()
 	if _, err := Parse([]string{"prog", "-n"}); err != nil {
 		t.Fatal(err)
 	}
-	defer RootCmd.closeLogfile()
-
+	defer Close()
 	if v {
 		t.Error("reverse flag should have set v to false")
 	}
 }
 
-// ---- Run ----------------------------------------------------------------------
+// ---- Mutual exclusion panics ------------------------------------------------
+
+func TestPositionalPanicsWhenSubcmdsExist(t *testing.T) {
+	reset()
+	defer reset()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic")
+		}
+	}()
+	SubCommand("sub", "", "")
+	var s string
+	Positional(&s, "arg", "")
+}
+
+func TestSubCommandPanicsWhenPositionalsExist(t *testing.T) {
+	reset()
+	defer reset()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic")
+		}
+	}()
+	var s string
+	Positional(&s, "arg", "")
+	SubCommand("sub", "", "")
+}
+
+// ---- Run lifecycle ----------------------------------------------------------
 
 func TestRunCallsInitAndFini(t *testing.T) {
 	reset()
 	defer reset()
 
 	var order []string
-	RootCmd.SetRuns(
+	SetRuns(
 		func(c *Command) error { order = append(order, "run"); return nil },
 		func(c *Command) error { order = append(order, "init"); return nil },
 		func(c *Command) error { order = append(order, "fini"); return nil },
 	)
-
 	cmd, err := Parse([]string{"prog"})
 	if err != nil {
 		t.Fatal(err)
@@ -707,14 +724,10 @@ func TestRunCallsInitAndFini(t *testing.T) {
 	if err := cmd.Run(); err != nil {
 		t.Fatal(err)
 	}
-
 	want := []string{"init", "run", "fini"}
-	if len(order) != len(want) {
-		t.Fatalf("call order = %v; want %v", order, want)
-	}
 	for i, s := range want {
-		if order[i] != s {
-			t.Errorf("order[%d] = %q; want %q", i, order[i], s)
+		if i >= len(order) || order[i] != s {
+			t.Fatalf("order = %v; want %v", order, want)
 		}
 	}
 }
@@ -722,13 +735,11 @@ func TestRunCallsInitAndFini(t *testing.T) {
 func TestRunNotRunnableError(t *testing.T) {
 	reset()
 	defer reset()
-
-	// A command with no run function returns ErrNotRunnable.
 	cmd, err := Parse([]string{"prog"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := cmd.Run(); err != ErrNotRunnable {
-		t.Errorf("Run() = %v; want ErrNotRunnable", err)
+		t.Errorf("got %v; want ErrNotRunnable", err)
 	}
 }

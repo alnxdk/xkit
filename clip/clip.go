@@ -737,23 +737,19 @@ func parseSubCommand(c *Command, str string) (consumed int, sc *Command, er erro
 	if len(c.subcmds) == 0 {
 		return 0, nil, nil
 	}
-	var scTmp *Command
+	// Exact name match wins over any longer prefix match (e.g. "gcloud"
+	// selects gcloud, not gcloud-new).
 	for _, s := range c.subcmds {
-		scTmp = nil
-		if len(s.Name) == len(str) {
-			if s.Name == str {
-				scTmp = s
-			}
-		} else if len(s.Name) > len(str) {
-			if strings.HasPrefix(s.Name, str) {
-				scTmp = s
-			}
+		if s.Name == str {
+			return 1, s, nil
 		}
-		if scTmp != nil {
+	}
+	for _, s := range c.subcmds {
+		if len(s.Name) > len(str) && strings.HasPrefix(s.Name, str) {
 			if sc != nil {
 				return 0, nil, fmt.Errorf("ambiguous command '%s'", str)
 			}
-			sc = scTmp
+			sc = s
 		}
 	}
 	if sc != nil {

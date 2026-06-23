@@ -592,6 +592,40 @@ func TestParseSubCommandAmbiguous(t *testing.T) {
 	Close()
 }
 
+func TestParseSubCommandExactMatchOverPrefix(t *testing.T) {
+	reset()
+	defer reset()
+
+	SubCommand("gcloud", "", "")
+	SubCommand("gcloud-new", "", "")
+
+	cmd, err := Parse([]string{"prog", "gcloud"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Close()
+	if cmd.Name != "gcloud" {
+		t.Errorf("matched %q; want \"gcloud\"", cmd.Name)
+	}
+}
+
+func TestParseSubCommandPrefixOfLongerName(t *testing.T) {
+	reset()
+	defer reset()
+
+	SubCommand("gcloud", "", "")
+	SubCommand("gcloud-new", "", "")
+
+	cmd, err := Parse([]string{"prog", "gcloud-n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Close()
+	if cmd.Name != "gcloud-new" {
+		t.Errorf("matched %q; want \"gcloud-new\"", cmd.Name)
+	}
+}
+
 func TestParseSubCommandWithOption(t *testing.T) {
 	reset()
 	defer reset()

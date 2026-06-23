@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.1
+
+### Bug fixes
+
+| # | Description |
+|---|-------------|
+| 1 | Sub-command resolution treated an exact name match as ambiguous when a longer command shared the same prefix (e.g. `gcloud` vs `gcloud-new`). Exact matches now take priority over prefix matches. |
+
+---
+
 ## v1.0.0
 
 ### Summary
